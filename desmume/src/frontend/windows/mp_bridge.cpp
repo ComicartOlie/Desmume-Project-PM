@@ -472,6 +472,8 @@ void OpenLobby(HWND parent)
     if (gLobby) { SetForegroundWindow(gLobby); return; }
     static BYTE buf[1024]; memset(buf, 0, sizeof(buf));
     BYTE* p = BeginDlg(buf, 4, 190, 150, L"Wireless Lobby");
+    // the lobby stays open for the whole session — let players minimize it
+    ((DLGTEMPLATE*)buf)->style |= WS_MINIMIZEBOX;
     AddItem(p, SS_LEFT, 8, 8, 174, 10, 200, 0x0082, L"Starting...");
     AddItem(p, WS_BORDER | LBS_NOINTEGRALHEIGHT, 8, 22, 174, 100, 201, 0x0083, L"");
     AddItem(p, WS_TABSTOP | BS_DEFPUSHBUTTON, 70, 128, 50, 14, IDCANCEL, 0x0080, L"Leave");
