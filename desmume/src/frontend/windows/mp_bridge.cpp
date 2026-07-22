@@ -815,11 +815,26 @@ void MpBridge_Pump()
                     if (pj != pi) gNet.enqueue(pj, rx, n);
 
             gBr.roleSeenAt[r] = gBr.frame;
-            if (tag >= 1 && tag <= 3) gBr.gameSeenAt[r] = gBr.frame;
+            if (tag >= 1 && tag <= 3)
+            {
+                // Peer NEWLY game-active (just activated Wireless Play, or
+                // reconnected): resend our on-change channels — anything we
+                // sent before this moment predates their readiness.
+                bool wasFresh = gBr.gameSeenAt[r] != 0 && gBr.frame - gBr.gameSeenAt[r] <= 180;
+                if (!wasFresh)
+                {
+                    gBr.lastParty.clear();
+                    gBr.lastPkt.clear();
+                }
+                gBr.gameSeenAt[r] = gBr.frame;
+            }
 
-            // game-mailbox apply only while an in-game session is active; in the
-            // lobby these frames don't arrive, but guard defensively so a stray
-            // bundle can never write ROM RAM before activation.
+            // Game-mailbox apply whenever the ROM's discovery block is up
+            // (romUp) — NOT gated on our own activation: the mailboxes are
+            // inert BSS until the ROM activates, and dropping pre-activation
+            // frames LOST the peer's one-shot on-change party send when they
+            // activated before us (the accepter never activated: its battle/
+            // trade launch waits on partner party bytes forever).
             //
             // LEGACY-CHANNEL PAIR ROUTING (3+ players): the single pairwise
             // import block / party buffer must only receive the CHOSEN pair
@@ -828,7 +843,7 @@ void MpBridge_Pump()
             // behaviour).  Without this every peer's bundle overwrote the
             // legacy block (last writer wins) and battle/trade/give requests
             // "broadcast" to every player.  Per-role arrays always update.
-            if (inGame && tag == 1 && sz == gBr.blkSize && n >= 4 + sz + 48)
+            if (romUp && tag == 1 && sz == gBr.blkSize && n >= 4 + sz + 48)
             {
                 u8 pairRole = apRd8(gBr.owExp + 0x18);
                 if (pairRole == 0 || r == (int)pairRole)
@@ -836,14 +851,14 @@ void MpBridge_Pump()
                 if (gBr.blkN) memcpy(apPtr(gBr.blkN + (r-1)*sz), rx + 4, sz);
                 memcpy(apPtr(gBr.owImp + (r-1)*48), rx + 4 + sz, 48);
             }
-            else if (inGame && tag == 2 && sz == gBr.partySize)
+            else if (romUp && tag == 2 && sz == gBr.partySize)
             {
                 u8 pairRole = apRd8(gBr.owExp + 0x18);
                 if (pairRole == 0 || r == (int)pairRole)
                     memcpy(apPtr(gBr.partyImp), rx + 4, sz);
                 if (gBr.partyN) memcpy(apPtr(gBr.partyN + (r-1)*sz), rx + 4, sz);
             }
-            else if (inGame && tag == 3 && sz == gBr.pktSize)
+            else if (romUp && tag == 3 && sz == gBr.pktSize)
             {
                 memcpy(apPtr(gBr.pktImp + (r-1)*sz), rx + 4, sz);
                 gBr.dbgPktRx++;
