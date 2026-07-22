@@ -804,15 +804,27 @@ void MpBridge_Pump()
             // game-mailbox apply only while an in-game session is active; in the
             // lobby these frames don't arrive, but guard defensively so a stray
             // bundle can never write ROM RAM before activation.
+            //
+            // LEGACY-CHANNEL PAIR ROUTING (3+ players): the single pairwise
+            // import block / party buffer must only receive the CHOSEN pair
+            // partner's data — the ROM publishes its intent in the OW export
+            // (pairRole @ +0x18; 0 = unpaired, keep first-come legacy
+            // behaviour).  Without this every peer's bundle overwrote the
+            // legacy block (last writer wins) and battle/trade/give requests
+            // "broadcast" to every player.  Per-role arrays always update.
             if (inGame && tag == 1 && sz == gBr.blkSize && n >= 4 + sz + 48)
             {
-                memcpy(apPtr(gBr.importBlk), rx + 4, sz);
+                u8 pairRole = apRd8(gBr.owExp + 0x18);
+                if (pairRole == 0 || r == (int)pairRole)
+                    memcpy(apPtr(gBr.importBlk), rx + 4, sz);
                 if (gBr.blkN) memcpy(apPtr(gBr.blkN + (r-1)*sz), rx + 4, sz);
                 memcpy(apPtr(gBr.owImp + (r-1)*48), rx + 4 + sz, 48);
             }
             else if (inGame && tag == 2 && sz == gBr.partySize)
             {
-                memcpy(apPtr(gBr.partyImp), rx + 4, sz);
+                u8 pairRole = apRd8(gBr.owExp + 0x18);
+                if (pairRole == 0 || r == (int)pairRole)
+                    memcpy(apPtr(gBr.partyImp), rx + 4, sz);
                 if (gBr.partyN) memcpy(apPtr(gBr.partyN + (r-1)*sz), rx + 4, sz);
             }
             else if (inGame && tag == 3 && sz == gBr.pktSize)
