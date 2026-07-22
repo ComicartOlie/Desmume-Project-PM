@@ -1,0 +1,13 @@
+# build outputs
+desmume/src/frontend/windows/__bins/
+desmume/src/frontend/windows/.libs/
+desmume/src/frontend/windows/x64/
+desmume/src/frontend/windows/*Release*/
+desmume/src/frontend/windows/Debug*/
+*.obj
+*.ilk
+*.iobj
+*.ipdb
+*.pdb
+*.pch
+*.tlog
