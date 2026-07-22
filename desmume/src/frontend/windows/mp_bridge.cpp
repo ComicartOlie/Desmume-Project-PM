@@ -846,6 +846,8 @@ void MpBridge_Pump()
             if (romUp && tag == 1 && sz == gBr.blkSize && n >= 4 + sz + 48)
             {
                 u8 pairRole = apRd8(gBr.owExp + 0x18);
+                rx[4 + 0x12] = (u8)r;   // stamp playerRole (the old hub did this;
+                                        // MpPartnerIsLead is dead without it)
                 if (pairRole == 0 || r == (int)pairRole)
                     memcpy(apPtr(gBr.importBlk), rx + 4, sz);
                 if (gBr.blkN) memcpy(apPtr(gBr.blkN + (r-1)*sz), rx + 4, sz);
