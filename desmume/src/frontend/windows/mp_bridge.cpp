@@ -64,6 +64,10 @@ struct MpNet
     MpPeer peers[3];            // host: up to 3 clients (slot i = role 2+i);
                                 // join: peers[0] = the host link
     bool connecting = false;    // join: non-blocking connect in flight
+    bool freshPeer = false;     // a link just came up: pump must resend
+                                // on-change channels (party/pkt) — their
+                                // caches predate this peer, so it would
+                                // otherwise NEVER receive our party
     u32 retryAt = 0;
     int assignedRole = 0;       // join: role handed out by the host (0xFF ctl frame)
     char myName[24] = "Player";
@@ -201,7 +205,7 @@ struct MpNet
                 SOCKET s = accept(listener, NULL, NULL);
                 if (s == INVALID_SOCKET) break;
                 setNonBlock(s);
-                peers[i].s = s; peers[i].up = true;
+                peers[i].s = s; peers[i].up = true; freshPeer = true;
                 u8 ctl[4] = { 2, 0, 0xFF, (u8)(2 + i) };   // [len=2][0xFF][role]
                 peers[i].tx.insert(peers[i].tx.end(), ctl, ctl + 4);
                 printf("[BR] peer accepted -> role %d\n", 2 + i);
@@ -218,7 +222,7 @@ struct MpNet
                 int r = select(0, NULL, &wr, &ex, &tv);
                 if (r > 0 && FD_ISSET(h.s, &wr))
                 {
-                    h.up = true; connecting = false;
+                    h.up = true; connecting = false; freshPeer = true;
                     printf("[BR] connected to %s\n", joinIP);
                 }
                 else if (r > 0 && FD_ISSET(h.s, &ex))
@@ -636,6 +640,18 @@ void MpBridge_Pump()
     gBr.frame++;
 
     gNet.tick(gBr.frame);
+
+    // A peer link just came up: drop the on-change send caches so the next
+    // pump resends party/pkt to everyone.  Without this a peer connecting
+    // AFTER our first send NEVER received our party — the receiving side's
+    // battle/trade launch waits on partner party bytes forever ("the
+    // accepter never gets the message").
+    if (gNet.freshPeer)
+    {
+        gNet.freshPeer = false;
+        gBr.lastParty.clear();
+        gBr.lastPkt.clear();
+    }
 
     // ROM discovery: scan periodically until found. Must NOT gate the
     // transport exchange below — the lobby connects at the title screen,
