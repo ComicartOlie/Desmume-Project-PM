@@ -2,13 +2,9 @@
 
 A fork of the [DeSmuME](https://desmume.org/) Nintendo DS emulator carrying the
 embedded multiplayer bridge for **Project PM**, a co-op multiplayer romhack of
-Pokémon Platinum. This is the Windows build bundled with the mod; players don't
-need anything from this repo unless they want to build the emulator themselves
-or read how the netplay works.
+Pokémon Platinum.
 
-Based on a DeSmuME 0.9.14 development snapshot. This repository's history
-starts at that snapshot rather than at upstream's git history, so it is
-published as a standalone repository instead of a GitHub fork.
+Based on a DeSmuME 0.9.14 development snapshot.
 
 ## What's different from stock DeSmuME
 
