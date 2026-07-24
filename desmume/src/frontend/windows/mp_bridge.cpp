@@ -366,7 +366,22 @@ u32 apFrame = 0;
 u32 apConnFrame = 0;
 int apInField = 0;
 u32 apFieldFC = 0;
+u32 apTouchFrames = 0;          // scripted stylus press countdown (seamwalk pattern)
 FILE* apCsv = NULL;
+
+// --- input record / replay (patMode 10 = record, 11 = replay) -------------
+// Frame-accurate button capture.  Record logs the user's real pad each frame
+// on-change; replay forces the same bits back.  Both anchor at field entry
+// (apInField) so boot/connect timing differences wash out — so the replay
+// instance must start from the SAME save/state as the recording.  Mask bit
+// layout matches the press mask below: A0 B1 sel2 start3 R4 L5 U6 D7 X10 Y11.
+struct ApRepEntry { u32 f; u32 mask; };
+static const int AP_REP_MAX = 65536;
+ApRepEntry apRepTab[AP_REP_MAX];
+int   apRepCount = 0, apRepIdx = 0;
+u32   apRepMask = 0, apAnchorFrame = 0, apRecLastMask = 0xFFFFFFFFu;
+FILE* apRecFile = NULL;
+int   apRecStarted = 0;
 
 } // namespace
 
@@ -617,7 +632,13 @@ void MpBridge_InitFromEnv()
             : (!strcmp(pat, "circle")) ? 2
             : (!strcmp(pat, "waggle")) ? 3
             : (!strcmp(pat, "ugclient")) ? 4
-            : (!strcmp(pat, "ughost")) ? 5 : 0;
+            : (!strcmp(pat, "ughost")) ? 5
+            : (!strcmp(pat, "startercrash")) ? 6
+            : (!strcmp(pat, "seamwalk")) ? 7
+            : (!strcmp(pat, "challenge")) ? 8
+            : (!strcmp(pat, "live")) ? 9
+            : (!strcmp(pat, "record")) ? 10
+            : (!strcmp(pat, "replay")) ? 11 : 0;
 
     gBr.armed = true;
     if (gNet.mode == 1) gNet.startHost(); else gNet.start();
@@ -629,11 +650,79 @@ void MpBridge_Shutdown()
 {
     gNet.shutdownAll();
     if (apCsv) { fclose(apCsv); apCsv = NULL; }
+    if (apRecFile) { fclose(apRecFile); apRecFile = NULL; }
 }
 
 // ---------------------------------------------------------------------------
 // Per-frame pump — melonDS BridgePump ported.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Alarm-corruption tripwire.  The seam freeze was a wild thumb-jump in the
+// IRQ handler: an ARMED OSAlarm's handler pointer got overwritten (with what
+// looked like 15-bit colour data) and the alarm then fired.  The ROM exports
+// &OSi_AlarmQueue at ctl+16; every frame we walk the queue, learn the armed
+// alarm structs (they are stable allocations), and watch queue + structs.
+// The core's write paths call MpWatch_OnWrite for EVERY CPU/DMA write while
+// armed (see lua-engine.h); writes from outside the SDK library region get
+// logged with the writing PC — the scribbler, caught red-handed.
+// ---------------------------------------------------------------------------
+bool gMpWatchArmed = false;
+struct MpWatchRange { u32 lo, hi; };
+static MpWatchRange sWatchRanges[20];
+static int  sWatchCount = 0;
+static u32  sWatchQueueAddr = 0;
+static u32  sWatchNodes[16];
+static int  sWatchNodeCount = 0;
+static u32  sNodeSnapHandler[16];
+static u32  sWatchHits = 0;
+static FILE* sWatchLogF = NULL;
+
+static void MpWatchLog(const char* fmt, ...)
+{
+    if (!sWatchLogF) sWatchLogF = fopen("desmume_alarmwatch.txt", "a");
+    if (!sWatchLogF) return;
+    va_list ap; va_start(ap, fmt);
+    vfprintf(sWatchLogF, fmt, ap);
+    va_end(ap);
+    fflush(sWatchLogF);
+}
+
+static int sWatchRole = 0;
+static int sTableRange = -1;   // extra range from mp_table_watch.txt: log ALL writers
+
+void MpWatch_OnWrite(unsigned int address, int size, unsigned int value)
+{
+    for (int i = 0; i < sWatchCount; i++)
+    {
+        if (address >= sWatchRanges[i].lo && address < sWatchRanges[i].hi)
+        {
+            u32 pc9 = NDS_ARM9.instruct_adr;
+            // The SDK libraries legitimately maintain their own statics
+            // (queue ops, thread saves, card state) — only FOREIGN writers
+            // matter.  The table watch is the exception: there we want EVERY
+            // writer's PC, engine code included.
+            if (i != sTableRange && pc9 >= 0x020CF000 && pc9 < 0x020DF000) return;
+            // Dedupe on (PC, 16-byte bucket): game callbacks running on the
+            // card/sound threads write their stack frames in-band constantly;
+            // one line per distinct writer+target keeps the log readable
+            // without losing the one write that matters.
+            {
+                static u32 sSeenPC[192], sSeenAddr[192];
+                static int sSeenN = 0;
+                u32 bucket = address & ~0xFu;
+                for (int k = 0; k < sSeenN; k++)
+                    if (sSeenPC[k] == pc9 && sSeenAddr[k] == bucket) return;
+                if (sSeenN < 192) { sSeenPC[sSeenN] = pc9; sSeenAddr[sSeenN] = bucket; sSeenN++; }
+            }
+            if (sWatchHits++ > 1500) return;   // absolute cap
+            MpWatchLog("WRITE role=%d f=%u addr=%08X val=%08X size=%d PC9=%08X LR9=%08X CPSR9=%08X PC7=%08X\n",
+                sWatchRole, gBr.frame, address, value, size,
+                pc9, NDS_ARM9.R[14], NDS_ARM9.CPSR.val, NDS_ARM7.instruct_adr);
+            return;
+        }
+    }
+}
+
 void MpBridge_Pump()
 {
     if (!gBr.armed) return;
@@ -846,9 +935,31 @@ void MpBridge_Pump()
             if (romUp && tag == 1 && sz == gBr.blkSize && n >= 4 + sz + 48)
             {
                 u8 pairRole = apRd8(gBr.owExp + 0x18);
+                // STRICT 3+ ROUTING (4P same-trainer fix): with two or more
+                // game-active peers, the legacy pairwise import only ever
+                // receives the CHOSEN partner (r == pairRole).  The old
+                // "pairRole 0 accepts everyone, last writer wins" open door
+                // is 2P protocol -- but in a 4P session it let a MID-BATTLE
+                // pair's per-turn block broadcasts (same trainerHash!) land
+                // in a still-unpaired third player's import during their
+                // entry stall, so P3 converted/synced against P1 instead of
+                // waiting for P4.  Unpaired in 3+ now receives nothing and
+                // simply keeps stalling for the real partner.
+                // Peer count for strictness: lobby-fresh (heartbeats keep
+                // roleSeenAt alive even mid-battle) AND has ever been
+                // game-active.  GamePeerMask aged out mid-battle (frozen
+                // exports stop game traffic), silently re-opening the door
+                // exactly while P1+P2 fought -- the war-zone imports that
+                // starved P3+P4's conversion (2026-07-23 4P trace).
+                int gamePeers = 0;
+                for (int gb = 1; gb <= 4; gb++)
+                    if (gb != myRole && gBr.roleSeenAt[gb] != 0
+                        && gBr.frame - gBr.roleSeenAt[gb] <= 300
+                        && gBr.gameSeenAt[gb] != 0) gamePeers++;
+                bool strict = (gamePeers >= 2);
                 rx[4 + 0x12] = (u8)r;   // stamp playerRole (the old hub did this;
                                         // MpPartnerIsLead is dead without it)
-                if (pairRole == 0 || r == (int)pairRole)
+                if ((pairRole == 0 && !strict) || r == (int)pairRole)
                     memcpy(apPtr(gBr.importBlk), rx + 4, sz);
                 if (gBr.blkN) memcpy(apPtr(gBr.blkN + (r-1)*sz), rx + 4, sz);
                 memcpy(apPtr(gBr.owImp + (r-1)*48), rx + 4 + sz, 48);
@@ -856,7 +967,13 @@ void MpBridge_Pump()
             else if (romUp && tag == 2 && sz == gBr.partySize)
             {
                 u8 pairRole = apRd8(gBr.owExp + 0x18);
-                if (pairRole == 0 || r == (int)pairRole)
+                int gamePeers = 0;
+                for (int gb = 1; gb <= 4; gb++)
+                    if (gb != myRole && gBr.roleSeenAt[gb] != 0
+                        && gBr.frame - gBr.roleSeenAt[gb] <= 300
+                        && gBr.gameSeenAt[gb] != 0) gamePeers++;
+                bool strict = (gamePeers >= 2);
+                if ((pairRole == 0 && !strict) || r == (int)pairRole)
                     memcpy(apPtr(gBr.partyImp), rx + 4, sz);
                 if (gBr.partyN) memcpy(apPtr(gBr.partyN + (r-1)*sz), rx + 4, sz);
             }
@@ -866,6 +983,41 @@ void MpBridge_Pump()
                 gBr.dbgPktRx++;
             }
         }
+    }
+
+    // PAIR REBIND / GHOST PURGE.  On a pairRole change to a REAL role, replay
+    // that role's latest cached block/party from the always-updated per-role
+    // arrays so the pair is instantly consistent.  A change to 0 is left
+    // ALONE: the ROM's pair re-validate briefly flaps pairRole to 0 when the
+    // partner's conversion window closes (published trainerHash drops for a
+    // tick) and re-courts mutually the next scan tick -- zeroing here killed
+    // the P3+P4 conversion mid-handshake (2026-07-23 regression).  The stale
+    // ex-partner hazard is handled where it actually bites: when OUR OWN
+    // battle ends (export inBattle 1->0), the import's magic dies so a
+    // frozen mid-battle partner block can't convert a LATER battle.
+    if (romUp && gBr.owExp && gBr.importBlk)
+    {
+        static u8 sLastPairRole = 0xFF;
+        u8 pr = apRd8(gBr.owExp + 0x18);
+        if (pr != sLastPairRole)
+        {
+            sLastPairRole = pr;
+            if (pr >= 1 && pr <= 4)
+            {
+                if (gBr.blkN)
+                    memcpy(apPtr(gBr.importBlk), apPtr(gBr.blkN + (pr-1)*gBr.blkSize), gBr.blkSize);
+                if (gBr.partyN && gBr.partyImp)
+                    memcpy(apPtr(gBr.partyImp), apPtr(gBr.partyN + (pr-1)*gBr.partySize), gBr.partySize);
+            }
+        }
+    }
+    if (romUp && gBr.exportBlk && gBr.importBlk)
+    {
+        static u8 sLastOwnInBattle = 0;
+        u8 ib = apRd8(gBr.exportBlk + 0x10);
+        if (!ib && sLastOwnInBattle)
+            apWr32(gBr.importBlk, 0);   // battle over: purge partner-block ghost
+        sLastOwnInBattle = ib;
     }
 
     if (inGame)
@@ -928,6 +1080,116 @@ void MpBridge_Pump()
             }
         }
     }
+
+    // ---- alarm tripwire maintenance: learn queue + armed structs, verify ----
+    if (romUp && gBr.ctl)
+    {
+        // ctl+16 = a literal from OS_InitAlarm's pool: lands somewhere in the
+        // OSi alarm BSS cluster (UseAlarm flag / queue head / valarm are
+        // adjacent words).  Watch the whole neighbourhood; resolve the exact
+        // queue head by probing for a word that behaves like one.
+        u32 w = apRd32(gBr.ctl + 16);
+        if (w >= 0x02000000 && w < 0x02400000)
+        {
+            u32 lo = (w - 0x10) & ~3u;
+            if (sWatchQueueAddr != w)
+            {
+                sWatchQueueAddr = w;
+                sWatchCount = 0;
+                sWatchNodeCount = 0;
+                sWatchHits = 0;
+                sWatchRole = myRole;
+                sWatchRanges[sWatchCount].lo = lo;
+                sWatchRanges[sWatchCount].hi = lo + 0x48;
+                sWatchCount++;
+                // The whole SDK-statics band: sound arena through the card
+                // library's common block (cardi_common holds the TRANSIENT
+                // card alarm that is armed exactly during seam card reads —
+                // the freeze victim's neighbourhood).  Positioned relative to
+                // the exported literal so ROM rebuilds keep working.
+                sWatchRanges[sWatchCount].lo = (w > 0x02002600) ? (w - 0x2600) : 0x02000000;
+                sWatchRanges[sWatchCount].hi = w + 0x2800;
+                sWatchCount++;
+                gMpWatchArmed = true;
+                MpWatchLog("ARMED role=%d f=%u cluster=%08X..%08X band=%08X..%08X (lit=%08X)\n",
+                    myRole, gBr.frame, lo, lo + 0x48,
+                    sWatchRanges[1].lo, sWatchRanges[1].hi, w);
+                // Optional extra watch: "addr len" (hex) in mp_table_watch.txt
+                // next to the exe — logs EVERY writer to that range with its
+                // PC (the gfx entry-table biography for the shadow hunt).
+                {
+                    FILE* tf = fopen("mp_table_watch.txt", "r");
+                    if (tf) {
+                        unsigned taddr = 0, tlen = 0;
+                        if (fscanf(tf, "%x %x", &taddr, &tlen) == 2
+                            && taddr >= 0x02000000u && taddr < 0x02400000u
+                            && tlen > 0 && tlen <= 0x1000u && sWatchCount < 20) {
+                            sTableRange = sWatchCount;
+                            sWatchRanges[sWatchCount].lo = taddr;
+                            sWatchRanges[sWatchCount].hi = taddr + tlen;
+                            sWatchCount++;
+                            MpWatchLog("TABLEWATCH role=%d %08X..%08X\n", myRole, taddr, taddr + tlen);
+                        }
+                        fclose(tf);
+                    }
+                }
+            }
+            // Resolve the live queue head: a word in the cluster holding a
+            // pointer to a sane-looking OSAlarm (handler word inside code).
+            static u32 sResolvedHead = 0;
+            if (!sResolvedHead)
+            {
+                for (u32 cand = lo; cand < lo + 0x48; cand += 4)
+                {
+                    u32 v = apRd32(cand);
+                    if (v < 0x02000000 || v >= 0x02400000 || (v & 3)) continue;
+                    u32 h = apRd32(v);                 // candidate node's handler
+                    if (h >= 0x02000000 && h < 0x02400000)
+                    {
+                        sResolvedHead = cand;
+                        MpWatchLog("QUEUE f=%u head=%08X (first node=%08X handler=%08X)\n",
+                            gBr.frame, cand, v, h);
+                        break;
+                    }
+                }
+            }
+            // Walk the queue; remember every armed alarm struct (sticky).
+            u32 node = sResolvedHead ? apRd32(sResolvedHead) : 0;
+            for (int g = 0; g < 8 && node; g++)
+            {
+                if (node < 0x02000000 || node >= 0x02400000 || (node & 3)) break;
+                int ki = -1;
+                for (int i = 0; i < sWatchNodeCount; i++)
+                    if (sWatchNodes[i] == node) { ki = i; break; }
+                if (ki < 0 && sWatchNodeCount < 16 && sWatchCount < 20)
+                {
+                    ki = sWatchNodeCount;
+                    sWatchNodes[sWatchNodeCount++] = node;
+                    sWatchRanges[sWatchCount].lo = node;
+                    sWatchRanges[sWatchCount].hi = node + 0x2C;   // sizeof(OSAlarm)
+                    sWatchCount++;
+                    sNodeSnapHandler[ki] = apRd32(node);
+                    MpWatchLog("NODE f=%u addr=%08X handler=%08X arg=%08X tag=%08X period=%08X%08X\n",
+                        gBr.frame, node, apRd32(node), apRd32(node + 4), apRd32(node + 8),
+                        apRd32(node + 0x20), apRd32(node + 0x1C));
+                }
+                node = apRd32(node + 0x18);   // OSAlarm.next
+            }
+            // Content sentinel (JIT-miss backup): a remembered struct's handler
+            // must never change to garbage while we watch.
+            for (int i = 0; i < sWatchNodeCount; i++)
+            {
+                u32 h = apRd32(sWatchNodes[i]);
+                if (h != sNodeSnapHandler[i])
+                {
+                    MpWatchLog("CONTENT f=%u node=%08X handler %08X -> %08X period=%08X R15(9)=%08X\n",
+                        gBr.frame, sWatchNodes[i], sNodeSnapHandler[i], h,
+                        apRd32(sWatchNodes[i] + 0x1C), NDS_ARM9.instruct_adr);
+                    sNodeSnapHandler[i] = h;
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -943,7 +1205,9 @@ void MpAp_OverrideInput()
     u32 press = 0;
 
     // ---- boot script: A through title/continue until the field runs ----
-    if (apFrame >= 700 && apFrame < 2000 && !apInField)
+    // Suppressed under MELONDS_AP_HOLD so the operator can drive the load/menu
+    // by hand (e.g. the "on my command" replay setup).
+    if (apFrame >= 700 && apFrame < 2000 && !apInField && !apHold)
     {
         if ((apFrame % 40) < 8) press |= (1 << 0);
     }
@@ -951,12 +1215,62 @@ void MpAp_OverrideInput()
     {
         // debug-inbox activation (cmd 19): the SELECT shortcut is gone —
         // in-game activation lives on the "Wireless Play" bag item now.
+        // Runs in LIVE mode too so a 2-instance session auto-connects; a
+        // solo live instance just searches harmlessly.
         u32 inbox = apRd32(gBr.disc + 17*4);
         if (inbox)
         {
             apWr32(inbox + 12, 19);
             apWr32(inbox + 16, 1);
             apWr32(inbox + 4, apRd32(inbox + 8) + 1);
+        }
+    }
+
+    // ---- LIVE INPUT (patMode 9): on-demand button presses from a command
+    // file, so an operator can drive this instance one step at a time.
+    // ROLE-AWARE: host reads mp_live_p1.txt, join reads mp_live_p2.txt (both
+    // instances share a cwd, so each must read its own).  One line:
+    //   <seq> <btn> <frames>
+    // btn is one of U D L R A B X Y S(tart) T(select).  A NEW seq starts a
+    // fresh hold for <frames> frames.  Re-read a few times/sec (cheap). ----
+    if (patMode == 9)
+    {
+        static int  liveSeq = -1;
+        static int  liveFramesLeft = 0;
+        static u32  liveBit = 0;
+        if ((apFrame & 3) == 0)
+        {
+            const char* lfn = (apMode == 0) ? "mp_live_p1.txt" : "mp_live_p2.txt";
+            FILE* lf = fopen(lfn, "r");
+            if (lf)
+            {
+                int seq = 0, frames = 0; char btn = 0;
+                if (fscanf(lf, "%d %c %d", &seq, &btn, &frames) == 3 && seq != liveSeq)
+                {
+                    liveSeq = seq;
+                    liveFramesLeft = (frames > 0 && frames < 600) ? frames : 1;
+                    switch (btn)
+                    {
+                        case 'A': liveBit = (1u << 0);  break;
+                        case 'B': liveBit = (1u << 1);  break;
+                        case 'T': liveBit = (1u << 2);  break;  // Select
+                        case 'S': liveBit = (1u << 3);  break;  // Start
+                        case 'R': liveBit = (1u << 4);  break;  // d-pad Right
+                        case 'L': liveBit = (1u << 5);  break;  // d-pad Left
+                        case 'U': liveBit = (1u << 6);  break;
+                        case 'D': liveBit = (1u << 7);  break;
+                        case 'X': liveBit = (1u << 10); break;
+                        case 'Y': liveBit = (1u << 11); break;
+                        default:  liveBit = 0;          break;
+                    }
+                }
+                fclose(lf);
+            }
+        }
+        if (liveFramesLeft > 0)
+        {
+            press |= liveBit;
+            liveFramesLeft--;
         }
     }
 
@@ -991,7 +1305,7 @@ void MpAp_OverrideInput()
             u32 winLo = (apMode == 0) ? 300u : 1700u;
             u32 winHi = (apMode == 0) ? 1500u : 2900u;
 
-            if (patMode >= 4)
+            if (patMode == 4 || patMode == 5)
             {
                 // Underground leave/re-enter repro (the manual recipe):
                 //   both: Y (registered Explorer Kit) then A every 1s x30 -> descend
@@ -1025,8 +1339,12 @@ void MpAp_OverrideInput()
                         press |= (1u << 0);                                // A x30: re-descend
                 }
             }
-            else if (cf >= winLo && cf < winHi)
+            else if (patMode <= 3 && cf >= winLo && cf < winHi)
             {
+                // Default wander patterns (0 walk / 1 run / 2 circle / 3
+                // waggle) ONLY.  Was ungated, so it shadowed the scripted
+                // patterns 6/7/8 during the window -> host wandered L/R, join
+                // wandered U/D, and the real recipe never ran.
                 if (patMode == 3)
                 {
                     u32 pc = (cf - winLo) % 510;
@@ -1056,6 +1374,77 @@ void MpAp_OverrideInput()
                         press |= (1 << (((cf / 90) & 1) ? 5 : 4));
                     else
                         press |= (1 << (((cf / 90) & 1) ? 7 : 6));
+                }
+            }
+            else if (patMode == 6)
+            {
+                // STARTER-CRASH repro (user recipe): both saves sit AT the
+                // briefcase scene.  Once connected, P1 (host) presses A once
+                // a second for ~10s to advance into starter select; P2 idles.
+                if (apMode == 0 && cf >= 300 && cf < 300 + 10*60 && ((cf - 300) % 60) < 8)
+                    press |= (1u << 0);                                    // A
+            }
+            else if (patMode == 7)
+            {
+                // SEAM-WALK repro (user recipe), made DETERMINISTIC.  The
+                // options-menu navigation was fragile (start-menu layout
+                // varies -> Down x4 missed Options -> no swap, just walking).
+                // Instead P1 swaps its appearance straight through the debug
+                // inbox (cmd 20 = set appearance byte) to HILBERT (type 8) --
+                // a known shadow-prone native-model character -- then P2
+                // steps one tile UP through the seam and one tile back DOWN.
+                if (apMode == 0)
+                {
+                    static int apSwapSent = 0;
+                    if (cf >= 600 && !apSwapSent && gBr.disc)
+                    {
+                        u32 inbox = apRd32(gBr.disc + 17 * 4);
+                        if (inbox)
+                        {
+                            apWr32(inbox + 12, 20);        // cmd 20 = set appearance
+                            apWr32(inbox + 16, 0x81);      // Hilbert (type 8), colour 1
+                            apWr32(inbox + 4, apRd32(inbox + 8) + 1);  // seq = ackSeq+1
+                            apSwapSent = 1;
+                            printf("[AP] seam: appearance swap -> Hilbert sent at cf=%u\n", cf);
+                            fflush(stdout);
+                        }
+                    }
+                }
+                else
+                {
+                    // Walk DECISIVELY across the seam and a few tiles beyond so
+                    // P2 settles clearly on the new map (not straddling the
+                    // boundary, which oscillated the map header ~16x and never
+                    // let the partner settle).  Long single hold, stop, hold
+                    // back.  ~72 frames ~= 4-5 tiles (walls just stop us).
+                    if (cf >= 1100 && cf < 1172)        press |= (1u << 6);    // Up x~5 (cross + settle)
+                    else if (cf >= 1600 && cf < 1672)   press |= (1u << 7);    // Down x~5 (back + settle)
+                }
+            }
+            else if (patMode == 8)
+            {
+                // BANNER-REFRESH repro (user recipe): both instances boot the
+                // SAME pokeplatinumtest save, so they start ON THE SAME TILE
+                // already facing DOWN.  P2 steps one tile DOWN -> lands right
+                // in front of P1 (P1 is already facing down, no turn needed).
+                // P1 presses A three times -> partner menu -> Battle,
+                // challenging P2.  P2 (join, role 2) is the ACCEPTER whose
+                // "<name> has challenged you!" banner refreshes.
+                if (apMode == 1)
+                {
+                    // brief tap: already facing down, so ~7 frames = exactly
+                    // ONE step (24 frames over-shot and left the house).
+                    if (cf >= 300 && cf < 307)          press |= (1u << 7);    // P2: Down one tile
+                    // AFTER the challenge lands (~cf 700), walk left/right in
+                    // place -- the reported refresh only happens while the
+                    // accepter MOVES, so this exercises it for the diag.
+                    else if (cf >= 800)                 press |= (1u << (((cf / 30) & 1) ? 5 : 4)); // L/R
+                }
+                else
+                {
+                    if (cf >= 500 && cf < 508)          press |= (1u << 0);    // A: open partner menu
+                    else if (cf >= 580 && cf < 588)     press |= (1u << 0);    // A: Battle
+                    else if (cf >= 660 && cf < 668)     press |= (1u << 0);    // A: confirm/extra
                 }
             }
         }
@@ -1100,9 +1489,82 @@ void MpAp_OverrideInput()
         }
     }
 
-    if (!press) return;
+    // ---- INPUT RECORD (patMode 10) / REPLAY (patMode 11) ----------------
+    // Record auto-arms at overworld entry and logs the user's real pad
+    // on-change.  Replay instead waits for an operator go-signal file
+    // (mp_replay_go.txt) and then plays the recording from the character's
+    // CURRENT position -- the operator loads the save + connects by hand first
+    // (MELONDS_AP_HOLD suppresses auto-boot/-connect), so playback never fights
+    // that setup.  The go file is one-shot (removed on trigger).
+    if (patMode == 10 && apInField)
+    {
+        if (!apRecStarted)
+        {
+            apRecStarted = 1; apAnchorFrame = apFrame;
+            apRecFile = fopen("mp_record.txt", "w"); apRecLastMask = 0xFFFFFFFFu;
+            printf("[AP] recording input -> mp_record.txt\n"); fflush(stdout);
+        }
+        u32 ff = apFrame - apAnchorFrame;
+        UserInput& uin = NDS_getProcessingUserInput();
+        u32 mask = 0;
+        if (uin.buttons.A) mask |= (1u << 0);
+        if (uin.buttons.B) mask |= (1u << 1);
+        if (uin.buttons.T) mask |= (1u << 2);
+        if (uin.buttons.S) mask |= (1u << 3);
+        if (uin.buttons.R) mask |= (1u << 4);
+        if (uin.buttons.L) mask |= (1u << 5);
+        if (uin.buttons.U) mask |= (1u << 6);
+        if (uin.buttons.D) mask |= (1u << 7);
+        if (uin.buttons.X) mask |= (1u << 10);
+        if (uin.buttons.Y) mask |= (1u << 11);
+        if (apRecFile && mask != apRecLastMask)
+        { fprintf(apRecFile, "%u %u\n", ff, mask); fflush(apRecFile); apRecLastMask = mask; }
+        return;   // record never overrides the user's live input
+    }
+    else if (patMode == 11)
+    {
+        if (!apRecStarted)
+        {
+            if ((apFrame & 7) == 0)   // poll the go-signal ~7x/sec
+            {
+                FILE* tf = fopen("mp_replay_go.txt", "r");
+                if (tf)
+                {
+                    fclose(tf); remove("mp_replay_go.txt");
+                    apRecStarted = 1; apAnchorFrame = apFrame;
+                    apRepCount = apRepIdx = 0; apRepMask = 0;
+                    FILE* rf = fopen("mp_record.txt", "r");
+                    if (rf)
+                    {
+                        u32 fr, mk;
+                        while (apRepCount < AP_REP_MAX && fscanf(rf, "%u %u", &fr, &mk) == 2)
+                        { apRepTab[apRepCount].f = fr; apRepTab[apRepCount].mask = mk; apRepCount++; }
+                        fclose(rf);
+                    }
+                    printf("[AP] replay triggered: %d events\n", apRepCount); fflush(stdout);
+                }
+            }
+        }
+        if (apRecStarted)
+        {
+            u32 ff = apFrame - apAnchorFrame;
+            while (apRepIdx < apRepCount && apRepTab[apRepIdx].f <= ff)
+            { apRepMask = apRepTab[apRepIdx].mask; apRepIdx++; }
+            press |= apRepMask;
+        }
+    }
+
+    if (!press && !apTouchFrames) return;
 
     UserInput& in = NDS_getProcessingUserInput();
+    if (apTouchFrames > 0)
+    {
+        // scripted stylus press: the options appearance RIGHT arrow
+        apTouchFrames--;
+        in.touch.touchX = 230;
+        in.touch.touchY = 151;
+        in.touch.isTouch = true;
+    }
     if (press & (1 << 0))  in.buttons.A = true;
     if (press & (1 << 1))  in.buttons.B = true;
     if (press & (1 << 2))  in.buttons.T = true;   // select

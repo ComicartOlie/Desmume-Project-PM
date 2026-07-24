@@ -209,6 +209,13 @@ void CallRegisteredLuaMemHook_LuaMatch(unsigned int address, int size, unsigned 
 
 FORCEINLINE void CallRegisteredLuaMemHook(unsigned int address, int size, unsigned int value, LuaMemHookType hookType)
 {
+	{	// Platinum MP: native alarm-corruption tripwire (mp_bridge.cpp).
+		// Disarmed = one global load + branch; armed only while diagnosing.
+		extern bool gMpWatchArmed;
+		void MpWatch_OnWrite(unsigned int address, int size, unsigned int value);
+		if (gMpWatchArmed && hookType == LUAMEMHOOK_WRITE)
+			MpWatch_OnWrite(address, size, value);
+	}
 	// performance critical! (called VERY frequently)
 	// I suggest timing a large number of calls to this function in Release if you change anything in here,
 	// before and after, because even the most innocent change can make it become 30% to 400% slower.
