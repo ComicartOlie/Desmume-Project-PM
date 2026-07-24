@@ -1,4 +1,4 @@
-# DeSmuME — Project PM fork
+# DeSmuME - Project PM fork
 
 A fork of the [DeSmuME](https://desmume.org/) Nintendo DS emulator carrying the
 embedded multiplayer bridge for **Project PM**, a co-op multiplayer romhack of
@@ -24,7 +24,7 @@ Windows, Visual Studio 2022:
 
 1. Open `desmume/src/frontend/windows/DeSmuME.sln`
 2. Configuration **Release Fastbuild**, platform **x64**
-3. Build — the exe lands in `desmume/src/frontend/windows/__bins/`
+3. Build. The exe lands in `desmume/src/frontend/windows/__bins/`
 
 ## Branch
 
@@ -32,7 +32,5 @@ All fork work is on **`platinum-mp`**.
 
 ## License
 
-DeSmuME is licensed under the **GNU GPL v2**, and so is this fork — this
-repository exists to satisfy that license by providing the complete modified
-source for the binaries distributed with the mod. All credit for the emulator
+DeSmuME is licensed under the **GNU GPL v2**, and so is this fork. All credit for the emulator
 itself goes to the DeSmuME team.
