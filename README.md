@@ -19,7 +19,7 @@ published as a standalone repository instead of a GitHub fork.
   names and ping while a session is up.
 
 The sibling melonDS port of the same bridge lives at
-[ComicartOlie/melonDS](https://github.com/ComicartOlie/melonDS) (branch
+[ComicartOlie/melonDS-Project-PM](https://github.com/ComicartOlie/melonDS-Project-PM) (branch
 `platinum-mp`).
 
 ## Building
