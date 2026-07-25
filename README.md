@@ -18,6 +18,24 @@ The sibling melonDS port of the same bridge lives at
 [ComicartOlie/melonDS-Project-PM](https://github.com/ComicartOlie/melonDS-Project-PM) (branch
 `platinum-mp`).
 
+## Hosting over the internet
+
+One player hosts ("Host LAN Game" in the Multiplayer menu); everyone else
+joins with the host's IP. On the same LAN or a VPN (Hamachi, Radmin,
+ZeroTier, Tailscale) this works with no setup. To host over the open
+internet, three things must all be true on the **host's** side. Joiners
+never need any of this:
+
+1. **Router port forward**: forward **TCP 7820** to the host PC.
+2. **Windows Firewall**: the router forwards the connection, but Windows
+   still has to accept it. The first time you host, the emulator offers to
+   add the firewall rule for you (one admin prompt, one time). Say yes.
+3. **A real public IP**: if your router's WAN address (in its admin page)
+   is different from what whatismyip.com shows, or starts with
+   100.64-100.127, your ISP has you behind CGNAT and no amount of port
+   forwarding will work. Use a VPN like Hamachi/ZeroTier, or have a friend
+   with a real IP host.
+
 ## Building
 
 Windows, Visual Studio 2022:
