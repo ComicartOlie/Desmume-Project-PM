@@ -2430,6 +2430,10 @@ int _main()
 	sndcoretype = (cmdline.disable_sound == 1) ? SNDCORE_DUMMY : GetPrivateProfileInt("Sound","SoundCore2", SNDCORE_DIRECTX, IniName);
 	sndbuffersize = GetPrivateProfileInt("Sound","SoundBufferSize2", DESMUME_SAMPLE_RATE*8/60, IniName);
 	CommonSettings.spuInterpolationMode = (SPUInterpolationMode)GetPrivateProfileInt("Sound","SPUInterpolation", 2, IniName);
+	// inis written by 0.9.14-based builds can hold 3 (Catmull-Rom), which the
+	// 0.9.13 SPU has no handler for
+	if ((int)CommonSettings.spuInterpolationMode > (int)SPUInterpolation_Cosine)
+		CommonSettings.spuInterpolationMode = SPUInterpolation_Cosine;
 
 	if (cmdline._spu_sync_mode == -1)
 		CommonSettings.SPU_sync_mode = GetPrivateProfileInt("Sound","SynchMode",1,IniName);
@@ -6518,7 +6522,6 @@ static LRESULT CALLBACK SoundSettingsDlgProc(HWND hDlg, UINT uMsg, WPARAM wParam
 			SendDlgItemMessage(hDlg, IDC_SPU_INTERPOLATION_CB, CB_ADDSTRING, 0, (LPARAM)"None (harsh, most accurate to NDS)");
 			SendDlgItemMessage(hDlg, IDC_SPU_INTERPOLATION_CB, CB_ADDSTRING, 0, (LPARAM)"Linear (smooth, most sound detail loss)");
 			SendDlgItemMessage(hDlg, IDC_SPU_INTERPOLATION_CB, CB_ADDSTRING, 0, (LPARAM)"Cosine (balanced, smooth and accurate)");
-			SendDlgItemMessage(hDlg, IDC_SPU_INTERPOLATION_CB, CB_ADDSTRING, 0, (LPARAM)"Catmull-Rom (smooth and bright)");
 			SendDlgItemMessage(hDlg, IDC_SPU_INTERPOLATION_CB, CB_SETCURSEL, (int)CommonSettings.spuInterpolationMode, 0);
 
 			// Setup Sound Buffer Size Edit Text
