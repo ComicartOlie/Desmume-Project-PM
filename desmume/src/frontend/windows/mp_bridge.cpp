@@ -28,6 +28,7 @@
 #include "armcpu.h"
 
 #include "mp_bridge.h"
+#include "winutil.h"   // IniName: persist the last-used relay server
 
 // ---------------------------------------------------------------------------
 // Emulated RAM accessors (retail DS: mask 0x3FFFFF) — melonDS apRd*/apWr8/apPtr.
@@ -51,6 +52,11 @@ namespace
 
 const int MP_PORT = 7820;
 const u32 MP_MAX_FRAME = 8192;
+const int MP_RELAY_PORT = 7833;   // default port of the PMRELAY1 relay server
+const u8  MP_WIRE_VER = 1;        // wire version: LAN beacon byte AND relay handshake
+// Community relay pre-filled in the online dialogs (reserved IP, survives
+// server migrations). A player-entered value in the ini always wins.
+const char* MP_DEFAULT_RELAY = "193.122.236.144:7833";
 
 // ---------------------------------------------------------------------------
 // Windows Firewall helper for hosting.  Router port-forwarding alone can't
@@ -217,7 +223,7 @@ struct MpNet
     {
         if (beaconTx == INVALID_SOCKET) return;
         u8 buf[32]; memset(buf, 0, sizeof(buf));
-        memcpy(buf, "PLATMP", 6); buf[6] = 1; buf[7] = players;
+        memcpy(buf, "PLATMP", 6); buf[6] = MP_WIRE_VER; buf[7] = players;
         // advertise the host's chosen lobby name (Host dialog), not the PC name
         int nl = (int)strlen(myName);
         if (nl == 0) { memcpy(buf + 8, "Player", 6); }
@@ -251,6 +257,482 @@ struct MpNet
         if (ip && ip[0]) { strncpy(joinIP, ip, sizeof(joinIP)-1); joinIP[sizeof(joinIP)-1] = 0; }
         connecting = false; retryAt = 0;
         for (int i = 0; i < 3; i++) dropPeer(i);
+    }
+
+    // =======================================================================
+    // Online relay mode (PMRELAY1) — see tools/relay/RELAY_PROTOCOL.md in the
+    // ROM repo.  Everyone dials OUT to a relay server; the relay splices host
+    // and joiner streams, so nobody port-forwards and players never see each
+    // other's IP.  After the short ASCII handshake, a spliced socket carries
+    // the normal game stream byte-for-byte — everything below the handshake
+    // (framing, role assignment, host relay, name/ping) is untouched.
+    // Outbound-only: no listener, no firewall prompt, no LAN beacon.
+    // =======================================================================
+    int onlineMode = 0;             // 0 LAN/direct, 1 relay host, 2 relay join
+    char relayDisp[160] = "";       // relay server as typed (display/config)
+    sockaddr_in relayAddr;          // resolved once at start (UI/env thread)
+    char roomCode[8] = "";          // host: relay-assigned; joiner: entered
+    char relayStatus[96] = "";      // one-line state for the lobby UI
+    bool relayFatal = false;        // terminal handshake error: stop retrying
+
+    SOCKET ctlSock = INVALID_SOCKET;   // host control connection
+    int ctlState = 0;               // 0 idle, 1 connecting, 2 await OK, 3 ready
+    std::vector<u8> ctlBuf;
+    u32 ctlRetryAt = 0;
+
+    struct RelayAccept             // host: one dial-out per JOIN ticket
+    {
+        SOCKET s = INVALID_SOCKET;
+        int state = 0;             // 1 connecting, 2 await OK
+        u32 ticket = 0;
+        u32 startedAt = 0;
+        std::vector<u8> buf;
+    };
+    RelayAccept racc[3];
+
+    SOCKET joinSock = INVALID_SOCKET;  // joiner handshake socket
+    int joinState = 0;              // 0 idle, 1 connecting, 2 await OK, 3 linked
+    std::vector<u8> joinBuf;
+    u32 joinRetryAt = 0, joinStartedAt = 0;
+    char codeFile[260] = "";        // MELONDS_AP_CODEFILE (host writes, joiner polls)
+    u32 codePollAt = 0;
+
+    void setRelayStatus(const char* s)
+    {
+        strncpy(relayStatus, s, sizeof(relayStatus) - 1);
+        relayStatus[sizeof(relayStatus) - 1] = 0;
+    }
+
+    void setRoomCode(const char* code)
+    {
+        int n = 0;
+        for (const char* c = code; *c && n < 7; c++)
+        {
+            char ch = *c;
+            if (ch >= 'a' && ch <= 'z') ch -= 32;
+            if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') continue;
+            roomCode[n++] = ch;
+        }
+        roomCode[n] = 0;
+    }
+
+    // "host[:port]" -> relayAddr.  BLOCKING (getaddrinfo): call only from the
+    // UI click / env init, never from the per-frame tick.
+    bool resolveRelay(const char* spec)
+    {
+        char hostpart[160];
+        int port = MP_RELAY_PORT;
+        strncpy(hostpart, spec ? spec : "", sizeof(hostpart) - 1);
+        hostpart[sizeof(hostpart) - 1] = 0;
+        if (char* c = strrchr(hostpart, ':'))
+        {
+            *c = 0;
+            int p = atoi(c + 1);
+            if (p > 0 && p < 65536) port = p;
+        }
+        if (!hostpart[0]) return false;
+        addrinfo hints; memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
+        addrinfo* res = NULL;
+        if (getaddrinfo(hostpart, NULL, &hints, &res) != 0 || !res) return false;
+        relayAddr = *(sockaddr_in*)res->ai_addr;
+        relayAddr.sin_port = htons((u_short)port);
+        freeaddrinfo(res);
+        strncpy(relayDisp, spec, sizeof(relayDisp) - 1);
+        relayDisp[sizeof(relayDisp) - 1] = 0;
+        return true;
+    }
+
+    bool startHostOnline(const char* server)
+    {
+        if (!resolveRelay(server)) return false;
+        mode = 1; onlineMode = 1;
+        relayFatal = false; roomCode[0] = 0;
+        ctlState = 0; ctlRetryAt = 0; ctlBuf.clear();
+        setRelayStatus("contacting relay...");
+        printf("[BR] online host via relay %s\n", relayDisp); fflush(stdout);
+        return true;
+    }
+
+    bool startJoinOnline(const char* server, const char* code)
+    {
+        if (!resolveRelay(server)) return false;
+        mode = 2; onlineMode = 2;
+        relayFatal = false; roomCode[0] = 0;
+        if (code && code[0]) setRoomCode(code);
+        joinState = 0; joinRetryAt = 0; joinBuf.clear();
+        connecting = false;
+        for (int i = 0; i < 3; i++) dropPeer(i);
+        setRelayStatus(roomCode[0] ? "connecting..." : "waiting for room code...");
+        printf("[BR] online join via relay %s code=%s\n", relayDisp,
+            roomCode[0] ? roomCode : "(from file)");
+        fflush(stdout);
+        return true;
+    }
+
+    void relayShutdown()
+    {
+        if (ctlSock != INVALID_SOCKET) { closesocket(ctlSock); ctlSock = INVALID_SOCKET; }
+        for (int i = 0; i < 3; i++) relayAccDrop(racc[i]);
+        if (joinSock != INVALID_SOCKET) { closesocket(joinSock); joinSock = INVALID_SOCKET; }
+        ctlState = 0; joinState = 0;
+        ctlBuf.clear(); joinBuf.clear();
+        onlineMode = 0; roomCode[0] = 0; relayStatus[0] = 0; relayFatal = false;
+    }
+
+    // Drain s into buf and extract one '\n' line (CR stripped) into out.
+    // 1 = got a line, 0 = no full line yet, -1 = connection dead / junk.
+    // Bytes left in buf after the newline are GAME bytes (the relay's OK and
+    // the first spliced data can share a TCP segment) — the caller must carry
+    // them into the game receive buffer, never drop them.
+    static int relayReadLine(SOCKET s, std::vector<u8>& buf, char* out, int outMax)
+    {
+        // The relay's final "ERR <token>\n" and its close usually land in the
+        // SAME segment — a buffered line must be delivered BEFORE reporting
+        // the connection dead, or every terminal error (NOROOM/VERSION/FULL)
+        // reads as a retryable dropout and the client retries forever.
+        bool dead = false;
+        char tmp[4096];
+        for (;;)
+        {
+            int r = ::recv(s, tmp, sizeof(tmp), 0);
+            if (r > 0) { buf.insert(buf.end(), tmp, tmp + r); if (buf.size() > 65536) return -1; }
+            else if (r == 0) { dead = true; break; }
+            else
+            {
+                if (WSAGetLastError() != WSAEWOULDBLOCK) dead = true;
+                break;
+            }
+        }
+        for (size_t i = 0; i < buf.size(); i++)
+        {
+            if (buf[i] != '\n') continue;
+            size_t n = i;
+            if (n && buf[n - 1] == '\r') n--;
+            if ((int)n > outMax - 1) n = (size_t)(outMax - 1);
+            memcpy(out, buf.data(), n); out[n] = 0;
+            buf.erase(buf.begin(), buf.begin() + i + 1);
+            return 1;              // dead-but-line-buffered: line first; the
+        }                          // next call reports the dead socket
+        return dead ? -1 : 0;
+    }
+
+    SOCKET relayDial()
+    {
+        SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
+        if (s == INVALID_SOCKET) return INVALID_SOCKET;
+        setNonBlock(s);
+        int r = ::connect(s, (sockaddr*)&relayAddr, sizeof(relayAddr));
+        if (r == 0 || WSAGetLastError() == WSAEWOULDBLOCK) return s;
+        closesocket(s);
+        return INVALID_SOCKET;
+    }
+
+    static int connPoll(SOCKET s)   // -1 failed, 0 still connecting, 1 writable
+    {
+        fd_set wr, ex; FD_ZERO(&wr); FD_ZERO(&ex);
+        FD_SET(s, &wr); FD_SET(s, &ex);
+        timeval tv = { 0, 0 };
+        int r = select(0, NULL, &wr, &ex, &tv);
+        if (r <= 0) return 0;
+        if (FD_ISSET(s, &ex)) return -1;
+        return FD_ISSET(s, &wr) ? 1 : 0;
+    }
+
+    static bool sendLine(SOCKET s, const char* text)
+    {
+        char line[224];
+        int n = _snprintf(line, sizeof(line) - 1, "%s\n", text);
+        if (n <= 0) return false;
+        return ::send(s, line, n, 0) == n;   // tiny writes; partial = failure
+    }
+
+    void writeCodeFile()
+    {
+        if (!codeFile[0] || !roomCode[0]) return;
+        FILE* f = fopen(codeFile, "wb");
+        if (!f) { printf("[BR] relay: cannot write code file %s\n", codeFile); return; }
+        fprintf(f, "%s\n", roomCode);
+        fclose(f);
+        printf("[BR] relay code written to %s\n", codeFile); fflush(stdout);
+    }
+
+    void relayAccDrop(RelayAccept& a)
+    {
+        if (a.s != INVALID_SOCKET) closesocket(a.s);
+        a.s = INVALID_SOCKET; a.state = 0; a.ticket = 0; a.buf.clear();
+    }
+
+    void relayCtlDrop(u32 frame, const char* why)
+    {
+        if (ctlSock != INVALID_SOCKET) closesocket(ctlSock);
+        ctlSock = INVALID_SOCKET; ctlState = 0; ctlBuf.clear();
+        for (int i = 0; i < 3; i++) relayAccDrop(racc[i]);   // dead room's tickets
+        roomCode[0] = 0;                 // a reconnect gets a NEW code
+        ctlRetryAt = frame + 600;        // ~10 s
+        setRelayStatus(why);
+        printf("[BR] relay ctl: %s\n", why); fflush(stdout);
+    }
+
+    void relayHostLine(u32 frame, const char* line)
+    {
+        if (!strncmp(line, "OK ", 3))
+        {
+            setRoomCode(line + 3);
+            ctlState = 3;
+            char st[96];
+            _snprintf(st, sizeof(st), "room code %s - share it", roomCode);
+            setRelayStatus(st);
+            printf("[BR] relay room code: %s\n", roomCode); fflush(stdout);
+            writeCodeFile();
+        }
+        else if (!strncmp(line, "JOIN ", 5))
+        {
+            u32 ticket = (u32)atoi(line + 5);
+            int used = 0;
+            for (int k = 0; k < 3; k++)
+                if (peers[k].up || peers[k].s != INVALID_SOCKET || racc[k].s != INVALID_SOCKET) used++;
+            if (used >= 3)
+            {
+                printf("[BR] relay: no free slot, ignoring ticket %u\n", ticket);
+                return;                  // ticket expires at the relay
+            }
+            for (int k = 0; k < 3; k++)
+            {
+                if (racc[k].s != INVALID_SOCKET) continue;
+                racc[k].s = relayDial();
+                if (racc[k].s == INVALID_SOCKET) return;
+                racc[k].state = 1; racc[k].ticket = ticket;
+                racc[k].startedAt = frame; racc[k].buf.clear();
+                return;
+            }
+        }
+        else if (!strcmp(line, "PING"))
+        {
+            sendLine(ctlSock, "PONG");
+        }
+        else if (!strncmp(line, "ERR ", 4))
+        {
+            char st[96];
+            _snprintf(st, sizeof(st), "relay refused: %s", line + 4);
+            setRelayStatus(st);
+            printf("[BR] relay host error: %s\n", line); fflush(stdout);
+            bool terminal = !strncmp(line + 4, "BADREQ", 6);
+            if (ctlSock != INVALID_SOCKET) closesocket(ctlSock);
+            ctlSock = INVALID_SOCKET; ctlState = 0; ctlBuf.clear(); roomCode[0] = 0;
+            if (terminal) relayFatal = true;
+            else ctlRetryAt = frame + 3600;   // FULL/RATE: back off ~60 s
+        }
+    }
+
+    void relayHostTick(u32 frame)
+    {
+        if (ctlState == 0)
+        {
+            if (!relayFatal && frame >= ctlRetryAt)
+            {
+                ctlSock = relayDial();
+                if (ctlSock == INVALID_SOCKET)
+                {
+                    ctlRetryAt = frame + 600;
+                    setRelayStatus("relay unreachable, retrying...");
+                }
+                else ctlState = 1;
+            }
+        }
+        else if (ctlState == 1)
+        {
+            int r = connPoll(ctlSock);
+            if (r < 0) relayCtlDrop(frame, "relay unreachable, retrying...");
+            else if (r > 0)
+            {
+                char hello[224];
+                _snprintf(hello, sizeof(hello), "PMRELAY1 HOST %d %s",
+                    (int)MP_WIRE_VER, myName[0] ? myName : "Player");
+                if (sendLine(ctlSock, hello)) ctlState = 2;
+                else relayCtlDrop(frame, "relay connection failed, retrying...");
+            }
+        }
+        else
+        {
+            char line[256];
+            int r = 0;
+            while (ctlSock != INVALID_SOCKET
+                && (r = relayReadLine(ctlSock, ctlBuf, line, sizeof(line))) > 0)
+                relayHostLine(frame, line);
+            if (ctlSock != INVALID_SOCKET && r < 0)
+                relayCtlDrop(frame, "relay connection lost, retrying...");
+        }
+
+        // pending dial-out accepts (one per JOIN ticket)
+        for (int i = 0; i < 3; i++)
+        {
+            RelayAccept& a = racc[i];
+            if (a.s == INVALID_SOCKET) continue;
+            if (frame - a.startedAt > 1200) { relayAccDrop(a); continue; }   // 20 s guard
+            if (a.state == 1)
+            {
+                int r = connPoll(a.s);
+                if (r < 0) { relayAccDrop(a); continue; }
+                if (r > 0)
+                {
+                    char hello[64];
+                    _snprintf(hello, sizeof(hello), "PMRELAY1 ACCEPT %s %u", roomCode, a.ticket);
+                    if (sendLine(a.s, hello)) a.state = 2;
+                    else { relayAccDrop(a); continue; }
+                }
+            }
+            else if (a.state == 2)
+            {
+                char line[256];
+                int r = relayReadLine(a.s, a.buf, line, sizeof(line));
+                if (r < 0) { relayAccDrop(a); continue; }
+                if (r == 0) continue;
+                if (!strcmp(line, "OK"))
+                {
+                    int slot = -1;
+                    for (int k = 0; k < 3; k++)
+                        if (!peers[k].up && peers[k].s == INVALID_SOCKET) { slot = k; break; }
+                    if (slot < 0) { relayAccDrop(a); continue; }
+                    // install exactly like an accept()ed LAN client, leftover
+                    // bytes included (they are the head of the game stream)
+                    MpPeer& p = peers[slot];
+                    p.s = a.s; p.up = true;
+                    p.rx.assign(a.buf.begin(), a.buf.end());
+                    p.tx.clear();
+                    freshPeer = true;
+                    u8 ctl[4] = { 2, 0, 0xFF, (u8)(2 + slot) };
+                    p.tx.insert(p.tx.end(), ctl, ctl + 4);
+                    printf("[BR] relay peer spliced -> role %d\n", 2 + slot); fflush(stdout);
+                    a.s = INVALID_SOCKET; a.state = 0; a.buf.clear();
+                }
+                else
+                {
+                    printf("[BR] relay accept refused: %s\n", line); fflush(stdout);
+                    relayAccDrop(a);
+                }
+            }
+        }
+    }
+
+    void relayJoinDrop(u32 frame, u32 backoff, const char* why)
+    {
+        if (joinSock != INVALID_SOCKET) closesocket(joinSock);
+        joinSock = INVALID_SOCKET; joinBuf.clear();
+        joinState = 0; joinRetryAt = frame + backoff;
+        setRelayStatus(why);
+    }
+
+    void relayJoinTick(u32 frame)
+    {
+        // harness path: poll the code file (~1/s) until it has a code
+        if (!roomCode[0] && codeFile[0] && frame >= codePollAt)
+        {
+            codePollAt = frame + 60;
+            FILE* f = fopen(codeFile, "rb");
+            if (f)
+            {
+                char tmp[16]; memset(tmp, 0, sizeof(tmp));
+                fread(tmp, 1, sizeof(tmp) - 1, f);
+                fclose(f);
+                setRoomCode(tmp);
+                if ((int)strlen(roomCode) < 5) roomCode[0] = 0;
+                else { printf("[BR] relay code from file: %s\n", roomCode); fflush(stdout); }
+            }
+        }
+        if (relayFatal || !roomCode[0]) return;
+
+        if (joinState == 3)
+        {
+            if (!peers[0].up)      // spliced link died: re-join through the relay
+            {
+                joinState = 0;
+                joinRetryAt = frame + 600;
+                setRelayStatus("connection lost, rejoining...");
+            }
+            return;
+        }
+
+        if (joinState == 0)
+        {
+            if (frame < joinRetryAt) return;
+            joinSock = relayDial();
+            if (joinSock == INVALID_SOCKET)
+            {
+                joinRetryAt = frame + 600;
+                setRelayStatus("relay unreachable, retrying...");
+                return;
+            }
+            joinBuf.clear();
+            joinState = 1;
+            joinStartedAt = frame;
+            setRelayStatus("connecting...");
+        }
+        else if (joinState == 1)
+        {
+            int r = connPoll(joinSock);
+            if (r < 0) { relayJoinDrop(frame, 600, "relay unreachable, retrying..."); return; }
+            if (r > 0)
+            {
+                char hello[224];
+                _snprintf(hello, sizeof(hello), "PMRELAY1 JOIN %s %d %s",
+                    roomCode, (int)MP_WIRE_VER, myName[0] ? myName : "Player");
+                if (sendLine(joinSock, hello)) { joinState = 2; setRelayStatus("waiting for host..."); }
+                else relayJoinDrop(frame, 600, "relay connection failed, retrying...");
+            }
+            else if (frame - joinStartedAt > 1200)
+                relayJoinDrop(frame, 600, "relay connect timeout, retrying...");
+        }
+        else if (joinState == 2)
+        {
+            char line[256];
+            int r = relayReadLine(joinSock, joinBuf, line, sizeof(line));
+            if (r < 0) { relayJoinDrop(frame, 600, "relay connection lost, retrying..."); return; }
+            if (r == 0)
+            {
+                // the relay answers within its 15 s ticket window; 40 s = dead
+                if (frame - joinStartedAt > 2400)
+                    relayJoinDrop(frame, 600, "no relay answer, retrying...");
+                return;
+            }
+            if (!strcmp(line, "OK"))
+            {
+                MpPeer& h = peers[0];
+                h.s = joinSock; h.up = true;
+                h.rx.assign(joinBuf.begin(), joinBuf.end());   // leftover = game bytes
+                h.tx.clear();
+                joinSock = INVALID_SOCKET; joinBuf.clear();
+                joinState = 3;
+                connecting = false;
+                freshPeer = true;
+                setRelayStatus("connected");
+                printf("[BR] connected via relay (room %s)\n", roomCode); fflush(stdout);
+            }
+            else if (!strncmp(line, "ERR ", 4))
+            {
+                const char* e = line + 4;
+                bool retry = !strncmp(e, "TIMEOUT", 7) || !strncmp(e, "CLOSED", 6)
+                          || !strncmp(e, "RATE", 4);
+                char st[96];
+                if (!strncmp(e, "NOROOM", 6))
+                    _snprintf(st, sizeof(st), "room %s not found - check the code", roomCode);
+                else if (!strncmp(e, "VERSION", 7))
+                    _snprintf(st, sizeof(st), "version mismatch with the host (%s)", e);
+                else if (!strncmp(e, "FULL", 4))
+                    _snprintf(st, sizeof(st), "room %s is full", roomCode);
+                else
+                    _snprintf(st, sizeof(st), "relay refused: %s", e);
+                printf("[BR] relay join error: %s\n", line); fflush(stdout);
+                relayJoinDrop(frame, retry ? 600 : 0, st);
+                if (!retry) relayFatal = true;
+            }
+        }
+    }
+
+    void relayTick(u32 frame)
+    {
+        if (mode == 1) relayHostTick(frame);
+        else if (mode == 2) relayJoinTick(frame);
     }
 
     void start()
@@ -287,6 +769,8 @@ struct MpNet
     {
         if (mode == 0) return;
 
+        if (onlineMode) relayTick(frame);   // relay handshakes + dial-out accepts
+
         if (mode == 1 && listener != INVALID_SOCKET)
         {
             // accept into any free slot; slot i is role 2+i (stable across
@@ -303,7 +787,7 @@ struct MpNet
                 printf("[BR] peer accepted -> role %d\n", 2 + i);
             }
         }
-        else if (mode == 2 && !peers[0].up)
+        else if (mode == 2 && !onlineMode && !peers[0].up)   // LAN/direct join only
         {
             MpPeer& h = peers[0];
             if (connecting)
@@ -401,6 +885,7 @@ struct MpNet
     {
         for (int i = 0; i < 3; i++) dropPeer(i);
         if (listener != INVALID_SOCKET) { closesocket(listener); listener = INVALID_SOCKET; }
+        relayShutdown();
         mode = 0;
     }
 };
@@ -486,7 +971,7 @@ int   apRecStarted = 0;
 // melonDS and BizHawk forks.  main.cpp forwards 3 messages.
 // ===========================================================================
 namespace {
-enum { MP_ID_HOST = 0xE100, MP_ID_JOIN, MP_ID_STOP };
+enum { MP_ID_HOST = 0xE100, MP_ID_JOIN, MP_ID_STOP, MP_ID_HOSTON, MP_ID_JOINON, MP_ID_RELAYCFG };
 HMENU gMpMenu = NULL;
 struct FoundHost { char ip[32]; char name[28]; u32 seen; };
 FoundHost gFound[8]; int gFoundN = 0;
@@ -544,7 +1029,20 @@ INT_PTR CALLBACK LobbyProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_INITDIALOG: SetTimer(h, 1, 500, NULL); return TRUE;
     case WM_TIMER: {
         char st[96];
-        if (gNet.mode == 1) _snprintf(st, sizeof(st), "Hosting on port 7820 - waiting for players");
+        if (gNet.onlineMode == 1)
+        {
+            if (gNet.roomCode[0])
+                _snprintf(st, sizeof(st), "Online - room code %s - share it with joiners", gNet.roomCode);
+            else
+                _snprintf(st, sizeof(st), "Online - %s",
+                    gNet.relayStatus[0] ? gNet.relayStatus : "contacting relay...");
+        }
+        else if (gNet.onlineMode == 2)
+            _snprintf(st, sizeof(st), "Online - room %s (%s)",
+                gNet.roomCode[0] ? gNet.roomCode : "?",
+                gNet.anyUp() ? "connected"
+                             : (gNet.relayStatus[0] ? gNet.relayStatus : "connecting..."));
+        else if (gNet.mode == 1) _snprintf(st, sizeof(st), "Hosting on port 7820 - waiting for players");
         else _snprintf(st, sizeof(st), "%s %s", gNet.anyUp() ? "Connected to" : "Connecting to", gNet.joinIP);
         SetDlgItemTextA(h, 200, st);
         HWND lb = GetDlgItem(h, 201);
@@ -666,6 +1164,170 @@ bool ShowJoinDialog(HWND parent)
     // Cancel shares the row via IDCANCEL implicit (Esc) — add explicit:
     return DialogBoxIndirectParamA(GetModuleHandle(NULL), (LPCDLGTEMPLATEA)buf, parent, JoinProc, 0) == 1;
 }
+
+// --- online (relay) dialogs: name (+ code for join). The relay-server text
+// box is HIDDEN unless the "Custom Relay Server" menu option is checked —
+// the baked default (or a previously saved custom value) is used silently.
+static char gDlgRelay[160];
+static char gDlgCode[16];
+static bool gShowRelayField = false;
+static bool gShowRelayLoaded = false;
+
+void mpLoadShowRelay()
+{
+    if (gShowRelayLoaded) return;
+    gShowRelayLoaded = true;
+    gShowRelayField = GetPrivateProfileIntA("ProjectPM", "ShowRelayField", 0, IniName) != 0;
+}
+
+void mpLoadRelayPref()
+{
+    if (!gDlgRelay[0])
+        GetPrivateProfileStringA("ProjectPM", "RelayServer", "", gDlgRelay, sizeof(gDlgRelay), IniName);
+    if (!gDlgRelay[0])   // nothing saved yet: pre-fill the community relay
+    {
+        strncpy(gDlgRelay, MP_DEFAULT_RELAY, sizeof(gDlgRelay) - 1);
+        gDlgRelay[sizeof(gDlgRelay) - 1] = 0;
+    }
+}
+void mpSaveRelayPref(const char* v)
+{
+    // Storing the baked default would pin it in the ini and shadow any future
+    // default we ship — persist only CUSTOM values, clear the key otherwise.
+    if (!strcmp(v, MP_DEFAULT_RELAY))
+        WritePrivateProfileStringA("ProjectPM", "RelayServer", NULL, IniName);
+    else
+        WritePrivateProfileStringA("ProjectPM", "RelayServer", v, IniName);
+}
+
+INT_PTR CALLBACK HostOnlineProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    if (m == WM_INITDIALOG)
+    {
+        SetDlgItemTextA(h, 100, gNet.myName);
+        mpLoadRelayPref();
+        if (GetDlgItem(h, 103)) SetDlgItemTextA(h, 103, gDlgRelay);
+        SetFocus(GetDlgItem(h, 100));
+        return FALSE;
+    }
+    if (m == WM_COMMAND)
+    {
+        if (LOWORD(w) == IDOK)
+        {
+            GetDlgItemTextA(h, 100, gDlgName, sizeof(gDlgName));
+            if (GetDlgItem(h, 103))
+            {
+                GetDlgItemTextA(h, 103, gDlgRelay, sizeof(gDlgRelay));
+                if (!gDlgRelay[0])
+                {
+                    MessageBoxA(h, "Enter a relay server address (ask your community, or run pm_relay.py on a server).",
+                        "Host Online Game", MB_OK);
+                    return TRUE;
+                }
+            }
+            else mpLoadRelayPref();   // hidden field: saved custom value or the baked default
+            EndDialog(h, 1); return TRUE;
+        }
+        if (LOWORD(w) == IDCANCEL) { EndDialog(h, 0); return TRUE; }
+    }
+    return FALSE;
+}
+
+INT_PTR CALLBACK JoinOnlineProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    if (m == WM_INITDIALOG)
+    {
+        SetDlgItemTextA(h, 100, gNet.myName);
+        mpLoadRelayPref();
+        if (GetDlgItem(h, 103)) SetDlgItemTextA(h, 103, gDlgRelay);
+        SetFocus(GetDlgItem(h, 100));
+        return FALSE;
+    }
+    if (m == WM_COMMAND)
+    {
+        if (LOWORD(w) == IDOK)
+        {
+            GetDlgItemTextA(h, 100, gDlgName, sizeof(gDlgName));
+            GetDlgItemTextA(h, 104, gDlgCode, sizeof(gDlgCode));
+            if (GetDlgItem(h, 103))
+            {
+                GetDlgItemTextA(h, 103, gDlgRelay, sizeof(gDlgRelay));
+                if (!gDlgRelay[0])
+                {
+                    MessageBoxA(h, "Enter a relay server address (the host can tell you which one they used).",
+                        "Join Online Game", MB_OK);
+                    return TRUE;
+                }
+            }
+            else mpLoadRelayPref();   // hidden field: saved custom value or the baked default
+            int cn = 0;
+            for (const char* c = gDlgCode; *c; c++) if (*c != ' ') cn++;
+            if (cn < 5)
+            {
+                MessageBoxA(h, "Enter the 5 character room code the host shared.",
+                    "Join Online Game", MB_OK);
+                return TRUE;
+            }
+            EndDialog(h, 1); return TRUE;
+        }
+        if (LOWORD(w) == IDCANCEL) { EndDialog(h, 0); return TRUE; }
+    }
+    return FALSE;
+}
+
+bool ShowHostOnlineDialog(HWND parent)
+{
+    mpLoadShowRelay();
+    static BYTE buf[1280]; memset(buf, 0, sizeof(buf));
+    if (gShowRelayField)
+    {
+        BYTE* p = BeginDlg(buf, 6, 200, 94, L"Host Online Game");
+        AddItem(p, SS_LEFT, 8, 8, 184, 10, (WORD)-1, 0x0082, L"Your name:");
+        AddItem(p, WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 8, 20, 184, 12, 100, 0x0081, L"");
+        AddItem(p, SS_LEFT, 8, 38, 184, 10, (WORD)-1, 0x0082, L"Relay server (host or host:port):");
+        AddItem(p, WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 8, 50, 184, 12, 103, 0x0081, L"");
+        AddItem(p, WS_TABSTOP | BS_DEFPUSHBUTTON, 84, 72, 56, 14, IDOK, 0x0080, L"Host Game");
+        AddItem(p, WS_TABSTOP | BS_PUSHBUTTON, 146, 72, 46, 14, IDCANCEL, 0x0080, L"Cancel");
+    }
+    else
+    {
+        BYTE* p = BeginDlg(buf, 4, 200, 62, L"Host Online Game");
+        AddItem(p, SS_LEFT, 8, 8, 184, 10, (WORD)-1, 0x0082, L"Your name:");
+        AddItem(p, WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 8, 20, 184, 12, 100, 0x0081, L"");
+        AddItem(p, WS_TABSTOP | BS_DEFPUSHBUTTON, 84, 40, 56, 14, IDOK, 0x0080, L"Host Game");
+        AddItem(p, WS_TABSTOP | BS_PUSHBUTTON, 146, 40, 46, 14, IDCANCEL, 0x0080, L"Cancel");
+    }
+    return DialogBoxIndirectParamA(GetModuleHandle(NULL), (LPCDLGTEMPLATEA)buf, parent, HostOnlineProc, 0) == 1;
+}
+
+bool ShowJoinOnlineDialog(HWND parent)
+{
+    mpLoadShowRelay();
+    static BYTE buf[1536]; memset(buf, 0, sizeof(buf));
+    if (gShowRelayField)
+    {
+        BYTE* p = BeginDlg(buf, 8, 200, 124, L"Join Online Game");
+        AddItem(p, SS_LEFT, 8, 8, 184, 10, (WORD)-1, 0x0082, L"Your name:");
+        AddItem(p, WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 8, 20, 184, 12, 100, 0x0081, L"");
+        AddItem(p, SS_LEFT, 8, 38, 184, 10, (WORD)-1, 0x0082, L"Relay server (host or host:port):");
+        AddItem(p, WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 8, 50, 184, 12, 103, 0x0081, L"");
+        AddItem(p, SS_LEFT, 8, 68, 90, 10, (WORD)-1, 0x0082, L"Room code:");
+        AddItem(p, WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL | ES_UPPERCASE, 8, 80, 70, 12, 104, 0x0081, L"");
+        AddItem(p, WS_TABSTOP | BS_DEFPUSHBUTTON, 84, 102, 56, 14, IDOK, 0x0080, L"Join");
+        AddItem(p, WS_TABSTOP | BS_PUSHBUTTON, 146, 102, 46, 14, IDCANCEL, 0x0080, L"Cancel");
+    }
+    else
+    {
+        BYTE* p = BeginDlg(buf, 6, 200, 92, L"Join Online Game");
+        AddItem(p, SS_LEFT, 8, 8, 184, 10, (WORD)-1, 0x0082, L"Your name:");
+        AddItem(p, WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 8, 20, 184, 12, 100, 0x0081, L"");
+        AddItem(p, SS_LEFT, 8, 38, 90, 10, (WORD)-1, 0x0082, L"Room code:");
+        AddItem(p, WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL | ES_UPPERCASE, 8, 50, 70, 12, 104, 0x0081, L"");
+        AddItem(p, WS_TABSTOP | BS_DEFPUSHBUTTON, 84, 70, 56, 14, IDOK, 0x0080, L"Join");
+        AddItem(p, WS_TABSTOP | BS_PUSHBUTTON, 146, 70, 46, 14, IDCANCEL, 0x0080, L"Cancel");
+    }
+    return DialogBoxIndirectParamA(GetModuleHandle(NULL), (LPCDLGTEMPLATEA)buf, parent, JoinOnlineProc, 0) == 1;
+}
 } // namespace
 
 void MpBridge_InstallMenu(HWND mainWnd)
@@ -675,6 +1337,10 @@ void MpBridge_InstallMenu(HWND mainWnd)
     gMpMenu = CreatePopupMenu();
     AppendMenuA(gMpMenu, MF_STRING, MP_ID_HOST, "&Host LAN Game...");
     AppendMenuA(gMpMenu, MF_STRING, MP_ID_JOIN, "&Join LAN Game...");
+    AppendMenuA(gMpMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(gMpMenu, MF_STRING, MP_ID_HOSTON, "Host &Online Game...");
+    AppendMenuA(gMpMenu, MF_STRING, MP_ID_JOINON, "Join O&nline Game...");
+    AppendMenuA(gMpMenu, MF_STRING, MP_ID_RELAYCFG, "Custom &Relay Server");
     AppendMenuA(gMpMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuA(gMpMenu, MF_STRING, MP_ID_STOP, "Dis&connect");
     InsertMenuA(bar, (UINT)-1, MF_BYPOSITION | MF_POPUP, (UINT_PTR)gMpMenu, "&Multiplayer");
@@ -686,7 +1352,11 @@ void MpBridge_OnInitPopup(HMENU menu)
     if (menu != gMpMenu) return;
     EnableMenuItem(gMpMenu, MP_ID_HOST, MF_BYCOMMAND | (gNet.mode ? MF_GRAYED : MF_ENABLED));
     EnableMenuItem(gMpMenu, MP_ID_JOIN, MF_BYCOMMAND | (gNet.mode ? MF_GRAYED : MF_ENABLED));
+    EnableMenuItem(gMpMenu, MP_ID_HOSTON, MF_BYCOMMAND | (gNet.mode ? MF_GRAYED : MF_ENABLED));
+    EnableMenuItem(gMpMenu, MP_ID_JOINON, MF_BYCOMMAND | (gNet.mode ? MF_GRAYED : MF_ENABLED));
     EnableMenuItem(gMpMenu, MP_ID_STOP, MF_BYCOMMAND | (gNet.mode ? MF_ENABLED : MF_GRAYED));
+    mpLoadShowRelay();
+    CheckMenuItem(gMpMenu, MP_ID_RELAYCFG, MF_BYCOMMAND | (gShowRelayField ? MF_CHECKED : MF_UNCHECKED));
 }
 
 bool MpBridge_HandleCommand(unsigned int id)
@@ -699,6 +1369,31 @@ bool MpBridge_HandleCommand(unsigned int id)
     if (id == MP_ID_JOIN) {
         gFoundN = 0;
         if (ShowJoinDialog(w) && gNet.joinIP[0]) { gNet.setName(gDlgName); gNet.joinTo(gNet.joinIP); MpArm(); OpenLobby(w); }
+        return true;
+    }
+    if (id == MP_ID_HOSTON) {
+        if (ShowHostOnlineDialog(w)) {
+            gNet.setName(gDlgName);
+            if (gNet.startHostOnline(gDlgRelay)) { mpSaveRelayPref(gDlgRelay); MpArm(); OpenLobby(w); }
+            else MessageBoxA(w, "Could not resolve the relay server address.",
+                "Host Online Game", MB_OK | MB_ICONERROR);
+        }
+        return true;
+    }
+    if (id == MP_ID_JOINON) {
+        if (ShowJoinOnlineDialog(w)) {
+            gNet.setName(gDlgName);
+            if (gNet.startJoinOnline(gDlgRelay, gDlgCode)) { mpSaveRelayPref(gDlgRelay); MpArm(); OpenLobby(w); }
+            else MessageBoxA(w, "Could not resolve the relay server address.",
+                "Join Online Game", MB_OK | MB_ICONERROR);
+        }
+        return true;
+    }
+    if (id == MP_ID_RELAYCFG) {
+        mpLoadShowRelay();
+        gShowRelayField = !gShowRelayField;
+        WritePrivateProfileStringA("ProjectPM", "ShowRelayField",
+            gShowRelayField ? "1" : "0", IniName);
         return true;
     }
     if (id == MP_ID_STOP) {
@@ -732,8 +1427,28 @@ void MpBridge_InitFromEnv()
             : (!strcmp(pat, "record")) ? 10
             : (!strcmp(pat, "replay")) ? 11 : 0;
 
+    const char* nm = getenv("MELONDS_AP_NAME");
+    if (nm) gNet.setName(nm);
+    const char* cfile = getenv("MELONDS_AP_CODEFILE");
+    if (cfile)
+    {
+        strncpy(gNet.codeFile, cfile, sizeof(gNet.codeFile) - 1);
+        gNet.codeFile[sizeof(gNet.codeFile) - 1] = 0;
+    }
+
     gBr.armed = true;
-    if (gNet.mode == 1) gNet.startHost(); else gNet.start();
+    const char* relay = getenv("MELONDS_AP_RELAY");
+    if (relay)
+    {
+        // online relay mode (harness): host gets a code (writes MELONDS_AP_
+        // CODEFILE); joiner uses MELONDS_AP_CODE or polls the code file.
+        const char* code = getenv("MELONDS_AP_CODE");
+        bool ok = (gNet.mode == 1) ? gNet.startHostOnline(relay)
+                                   : gNet.startJoinOnline(relay, code ? code : "");
+        if (!ok) { printf("[BR] relay address unresolvable: %s\n", relay); fflush(stdout); }
+    }
+    else if (gNet.mode == 1) gNet.startHost();
+    else gNet.start();
     printf("[BR] armed: %s pattern=%d\n", (apMode == 0) ? "host" : "join", patMode);
     fflush(stdout);
 }
@@ -873,7 +1588,9 @@ void MpBridge_Pump()
         apWr8(gBr.ctl + 6, ++gBr.beat);   // fork heartbeat
     }
 
-    if (gNet.mode == 1 && (gBr.frame - gNet.lastBeacon) >= 60) {
+    // LAN beacon: LAN hosting only. An online room is not joinable via LAN,
+    // so advertising it would just mislead the browse list.
+    if (gNet.mode == 1 && !gNet.onlineMode && (gBr.frame - gNet.lastBeacon) >= 60) {
         gNet.lastBeacon = gBr.frame;
         gNet.beaconBroadcast((u8)(gBr.FreshPeerMask(gNet.myRole()) ? 2 : 1));
     }
