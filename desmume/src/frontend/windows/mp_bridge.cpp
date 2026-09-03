@@ -53,7 +53,7 @@ namespace
 const int MP_PORT = 7820;
 const u32 MP_MAX_FRAME = 8192;
 const int MP_RELAY_PORT = 7833;   // default port of the PMRELAY1 relay server
-const u8  MP_WIRE_VER = 1;        // wire version: LAN beacon byte AND relay handshake
+const u8  MP_WIRE_VER = 2;        // wire version: LAN beacon byte AND relay handshake (2 = 8-player rooms)
 // Community relay pre-filled in the online dialogs (reserved IP, survives
 // server migrations). A player-entered value in the ini always wins.
 const char* MP_DEFAULT_RELAY = "193.122.236.144:7833";
@@ -158,7 +158,7 @@ struct MpNet
     int mode = 0;               // 0 off, 1 host, 2 join
     char joinIP[64] = "127.0.0.1";
     SOCKET listener = INVALID_SOCKET;
-    MpPeer peers[3];            // host: up to 3 clients (slot i = role 2+i);
+    MpPeer peers[7];            // host: up to 3 clients (slot i = role 2+i);
                                 // join: peers[0] = the host link
     bool connecting = false;    // join: non-blocking connect in flight
     bool freshPeer = false;     // a link just came up: pump must resend
@@ -168,8 +168,8 @@ struct MpNet
     u32 retryAt = 0;
     int assignedRole = 0;       // join: role handed out by the host (0xFF ctl frame)
     char myName[24] = "Player";
-    char rname[5][24] = {{0}};   // lobby display name by role (1..4)
-    u16 rping[5] = {0};          // that role's ping-to-host, ms
+    char rname[9][24] = {{0}};   // lobby display name by role (1..4)
+    u16 rping[9] = {0};          // that role's ping-to-host, ms
     u16 myPingMs = 0;            // our own measured ping to the host
     u32 pingSentAt = 0;          // GetTickCount at last ping send
     u32 lastPing = 0;
@@ -186,7 +186,7 @@ struct MpNet
         buf[2] = (u8)(myPingMs & 0xFF); buf[3] = (u8)(myPingMs >> 8);
         buf[4] = (u8)nl; memcpy(buf + 5, myName, nl);
         sendAll(buf, 5 + nl);
-        if (myRole >= 1 && myRole <= 4) { memcpy(rname[myRole], myName, nl); rname[myRole][nl] = 0; rping[myRole] = myPingMs; }
+        if (myRole >= 1 && myRole <= 8) { memcpy(rname[myRole], myName, nl); rname[myRole][nl] = 0; rping[myRole] = myPingMs; }
     }
     void sendPing(int myRole)   // clients ping the host
     {
@@ -199,7 +199,7 @@ struct MpNet
     }
 
     int myRole() const { return (mode == 1) ? 1 : (assignedRole ? assignedRole : 2); }
-    bool anyUp() const { for (int i = 0; i < 3; i++) if (peers[i].up) return true; return false; }
+    bool anyUp() const { for (int i = 0; i < 7; i++) if (peers[i].up) return true; return false; }
 
     static void setNonBlock(SOCKET s)
     {
@@ -256,7 +256,7 @@ struct MpNet
         mode = 2;
         if (ip && ip[0]) { strncpy(joinIP, ip, sizeof(joinIP)-1); joinIP[sizeof(joinIP)-1] = 0; }
         connecting = false; retryAt = 0;
-        for (int i = 0; i < 3; i++) dropPeer(i);
+        for (int i = 0; i < 7; i++) dropPeer(i);
     }
 
     // =======================================================================
@@ -288,7 +288,7 @@ struct MpNet
         u32 startedAt = 0;
         std::vector<u8> buf;
     };
-    RelayAccept racc[3];
+    RelayAccept racc[7];
 
     SOCKET joinSock = INVALID_SOCKET;  // joiner handshake socket
     int joinState = 0;              // 0 idle, 1 connecting, 2 await OK, 3 linked
@@ -362,7 +362,7 @@ struct MpNet
         if (code && code[0]) setRoomCode(code);
         joinState = 0; joinRetryAt = 0; joinBuf.clear();
         connecting = false;
-        for (int i = 0; i < 3; i++) dropPeer(i);
+        for (int i = 0; i < 7; i++) dropPeer(i);
         setRelayStatus(roomCode[0] ? "connecting..." : "waiting for room code...");
         printf("[BR] online join via relay %s code=%s\n", relayDisp,
             roomCode[0] ? roomCode : "(from file)");
@@ -373,7 +373,7 @@ struct MpNet
     void relayShutdown()
     {
         if (ctlSock != INVALID_SOCKET) { closesocket(ctlSock); ctlSock = INVALID_SOCKET; }
-        for (int i = 0; i < 3; i++) relayAccDrop(racc[i]);
+        for (int i = 0; i < 7; i++) relayAccDrop(racc[i]);
         if (joinSock != INVALID_SOCKET) { closesocket(joinSock); joinSock = INVALID_SOCKET; }
         ctlState = 0; joinState = 0;
         ctlBuf.clear(); joinBuf.clear();
@@ -467,7 +467,7 @@ struct MpNet
     {
         if (ctlSock != INVALID_SOCKET) closesocket(ctlSock);
         ctlSock = INVALID_SOCKET; ctlState = 0; ctlBuf.clear();
-        for (int i = 0; i < 3; i++) relayAccDrop(racc[i]);   // dead room's tickets
+        for (int i = 0; i < 7; i++) relayAccDrop(racc[i]);   // dead room's tickets
         roomCode[0] = 0;                 // a reconnect gets a NEW code
         ctlRetryAt = frame + 600;        // ~10 s
         setRelayStatus(why);
@@ -490,14 +490,14 @@ struct MpNet
         {
             u32 ticket = (u32)atoi(line + 5);
             int used = 0;
-            for (int k = 0; k < 3; k++)
+            for (int k = 0; k < 7; k++)
                 if (peers[k].up || peers[k].s != INVALID_SOCKET || racc[k].s != INVALID_SOCKET) used++;
             if (used >= 3)
             {
                 printf("[BR] relay: no free slot, ignoring ticket %u\n", ticket);
                 return;                  // ticket expires at the relay
             }
-            for (int k = 0; k < 3; k++)
+            for (int k = 0; k < 7; k++)
             {
                 if (racc[k].s != INVALID_SOCKET) continue;
                 racc[k].s = relayDial();
@@ -565,7 +565,7 @@ struct MpNet
         }
 
         // pending dial-out accepts (one per JOIN ticket)
-        for (int i = 0; i < 3; i++)
+        for (int i = 0; i < 7; i++)
         {
             RelayAccept& a = racc[i];
             if (a.s == INVALID_SOCKET) continue;
@@ -591,7 +591,7 @@ struct MpNet
                 if (!strcmp(line, "OK"))
                 {
                     int slot = -1;
-                    for (int k = 0; k < 3; k++)
+                    for (int k = 0; k < 7; k++)
                         if (!peers[k].up && peers[k].s == INVALID_SOCKET) { slot = k; break; }
                     if (slot < 0) { relayAccDrop(a); continue; }
                     // install exactly like an accept()ed LAN client, leftover
@@ -775,7 +775,7 @@ struct MpNet
         {
             // accept into any free slot; slot i is role 2+i (stable across
             // reconnects, so a rejoining player gets its old role back)
-            for (int i = 0; i < 3; i++)
+            for (int i = 0; i < 7; i++)
             {
                 if (peers[i].up) continue;
                 SOCKET s = accept(listener, NULL, NULL);
@@ -822,7 +822,7 @@ struct MpNet
             }
         }
 
-        for (int i = 0; i < 3; i++) { flush(i); pumpRecv(i); }
+        for (int i = 0; i < 7; i++) { flush(i); pumpRecv(i); }
     }
 
     void enqueue(int i, const u8* p, u32 n)
@@ -838,7 +838,7 @@ struct MpNet
 
     void sendAll(const u8* p, u32 n)
     {
-        for (int i = 0; i < 3; i++) enqueue(i, p, n);
+        for (int i = 0; i < 7; i++) enqueue(i, p, n);
     }
 
     void flush(int i)
@@ -883,7 +883,7 @@ struct MpNet
 
     void shutdownAll()
     {
-        for (int i = 0; i < 3; i++) dropPeer(i);
+        for (int i = 0; i < 7; i++) dropPeer(i);
         if (listener != INVALID_SOCKET) { closesocket(listener); listener = INVALID_SOCKET; }
         relayShutdown();
         mode = 0;
@@ -917,13 +917,13 @@ struct BridgeSt
      *    Wireless Play. Drives the ROM-visible peerMask/status; without the
      *    split, a player idling in the lobby made the game flash "wireless
      *    connected" the instant the local player activated. */
-    u32 roleSeenAt[5] = { 0, 0, 0, 0, 0 };
-    u32 gameSeenAt[5] = { 0, 0, 0, 0, 0 };
+    u32 roleSeenAt[9] = {};
+    u32 gameSeenAt[9] = {};
 
     u8 MaskOf(const u32* seen, int myRole) const
     {
         u8 m = 0;
-        for (int r = 1; r <= 4; r++)
+        for (int r = 1; r <= 8; r++)
             if (r != myRole && seen[r] != 0 && frame - seen[r] <= 180)
                 m |= (u8)(1u << (r - 1));
         return m;
@@ -1048,7 +1048,7 @@ INT_PTR CALLBACK LobbyProc(HWND h, UINT m, WPARAM w, LPARAM l)
         HWND lb = GetDlgItem(h, 201);
         SendMessageA(lb, LB_RESETCONTENT, 0, 0);
         int me = gNet.myRole(); u8 mask = gBr.FreshPeerMask(me);
-        for (int r = 1; r <= 4; r++) {
+        for (int r = 1; r <= 8; r++) {
             bool present = (r == me) || (mask & (1 << (r - 1)));
             if (!present) continue;
             char line[80];
@@ -1665,7 +1665,7 @@ void MpBridge_Pump()
     {
         u8 rx[MP_MAX_FRAME];
         u32 n;
-        for (int pi = 0; pi < 3; pi++)
+        for (int pi = 0; pi < 7; pi++)
         while ((n = gNet.recvFrame(pi, rx, sizeof(rx))) > 0)
         {
             gBr.dbgRx++;
@@ -1692,24 +1692,24 @@ void MpBridge_Pump()
             if (n >= 5 && rx[0] == 0xFE) {
                 // lobby name announce: [0xFE][role][ping16][len][name]
                 int r2 = rx[1]; u16 png = (u16)(rx[2] | (rx[3] << 8)); int nl = rx[4];
-                if (r2 >= 1 && r2 <= 4 && nl <= 23 && (u32)n >= (u32)(5 + nl)) {
+                if (r2 >= 1 && r2 <= 8 && nl <= 23 && (u32)n >= (u32)(5 + nl)) {
                     memcpy(gNet.rname[r2], rx + 5, nl); gNet.rname[r2][nl] = 0; gNet.rping[r2] = png;
                     gBr.roleSeenAt[r2] = gBr.frame;
-                    if (myRole == 1) for (int pj = 0; pj < 3; pj++) if (pj != pi) gNet.enqueue(pj, rx, n);
+                    if (myRole == 1) for (int pj = 0; pj < 7; pj++) if (pj != pi) gNet.enqueue(pj, rx, n);
                 }
                 continue;
             }
             if (n < 4) continue;
             int tag = rx[0], r = rx[1];
             u32 sz = (u32)(rx[2] | (rx[3] << 8));
-            if (r < 1 || r > 4 || r == myRole) continue;
+            if (r < 1 || r > 8 || r == myRole) continue;
             if (n < 4 + sz) continue;
 
             // Host relay: clients only reach the host — forward every client
             // bundle to the other clients so they see EACH OTHER (the origin
             // ignores its own echo via the r == myRole check).
             if (myRole == 1)
-                for (int pj = 0; pj < 3; pj++)
+                for (int pj = 0; pj < 7; pj++)
                     if (pj != pi) gNet.enqueue(pj, rx, n);
 
             gBr.roleSeenAt[r] = gBr.frame;
@@ -1761,7 +1761,7 @@ void MpBridge_Pump()
                 // exactly while P1+P2 fought -- the war-zone imports that
                 // starved P3+P4's conversion (2026-07-23 4P trace).
                 int gamePeers = 0;
-                for (int gb = 1; gb <= 4; gb++)
+                for (int gb = 1; gb <= 8; gb++)
                     if (gb != myRole && gBr.roleSeenAt[gb] != 0
                         && gBr.frame - gBr.roleSeenAt[gb] <= 300
                         && gBr.gameSeenAt[gb] != 0) gamePeers++;
@@ -1777,7 +1777,7 @@ void MpBridge_Pump()
             {
                 u8 pairRole = apRd8(gBr.owExp + 0x18);
                 int gamePeers = 0;
-                for (int gb = 1; gb <= 4; gb++)
+                for (int gb = 1; gb <= 8; gb++)
                     if (gb != myRole && gBr.roleSeenAt[gb] != 0
                         && gBr.frame - gBr.roleSeenAt[gb] <= 300
                         && gBr.gameSeenAt[gb] != 0) gamePeers++;
@@ -1811,7 +1811,7 @@ void MpBridge_Pump()
         if (pr != sLastPairRole)
         {
             sLastPairRole = pr;
-            if (pr >= 1 && pr <= 4)
+            if (pr >= 1 && pr <= 8)
             {
                 if (gBr.blkN)
                     memcpy(apPtr(gBr.importBlk), apPtr(gBr.blkN + (pr-1)*gBr.blkSize), gBr.blkSize);
