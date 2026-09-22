@@ -492,7 +492,11 @@ struct MpNet
             int used = 0;
             for (int k = 0; k < 7; k++)
                 if (peers[k].up || peers[k].s != INVALID_SOCKET || racc[k].s != INVALID_SOCKET) used++;
-            if (used >= 3)
+            if (used >= 7)   // 7 joiner slots (peers/racc are [7], roles 2..8) =
+                             // 8-player rooms.  Was a stale 3 (host + 3 = 4) that
+                             // the 8P widening missed: a bare literal, not tied to
+                             // an array bound or loop, so the [3]->[7] sweep skipped
+                             // it and DeSmuME-hosted online rooms capped at 4.
             {
                 printf("[BR] relay: no free slot, ignoring ticket %u\n", ticket);
                 return;                  // ticket expires at the relay
