@@ -1,14 +1,4 @@
-/*
-    mp_bridge.cpp — fork-embedded mailbox bridge + test autopilot.
-    See mp_bridge.h for the overview.  This is a port of the melonDS fork's
-    BridgePump + apApply (melonDS/src/frontend/qt_sdl/EmuThread.cpp), with the
-    ENet LAN transport replaced by a direct non-blocking TCP pair and input
-    injection going through NDS_getProcessingUserInput() instead of a key mask.
-
-    Everything runs on the emulation thread; sockets are non-blocking and
-    drained/flushed with bounded work per frame (DeSmuME's run loop is
-    single-threaded — a blocking call here would freeze emulation).
-*/
+// Mailbox bridge (see mp_bridge.h). Runs on the emulation thread, so sockets never block.
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -30,11 +20,7 @@
 #include "mp_bridge.h"
 #include "winutil.h"   // IniName: persist the last-used relay server
 
-// ---------------------------------------------------------------------------
-// Emulated RAM accessors (retail DS: mask 0x3FFFFF) — melonDS apRd*/apWr8/apPtr.
-// Direct array access on purpose: mailboxes are .bss data, never executed, so
-// no JIT invalidation or IO dispatch is wanted (same as the melonDS fork).
-// ---------------------------------------------------------------------------
+// Emulated main RAM accessors. Direct array access: the mailboxes are plain data, no JIT or IO dispatch wanted.
 static inline u32 apRd32(u32 a) { return T1ReadLong(MMU.MAIN_MEM, a & _MMU_MAIN_MEM_MASK32); }
 static inline u16 apRd16(u32 a) { return T1ReadWord(MMU.MAIN_MEM, a & _MMU_MAIN_MEM_MASK16); }
 static inline s16 apRd16s(u32 a) { return (s16)apRd16(a); }
@@ -49,10 +35,7 @@ static void mpCleanName(char* s)
     for (; *s; s++) if ((unsigned char)*s < 0x20 || *s == 0x7F) *s = '?';
 }
 
-// ---------------------------------------------------------------------------
-// Transport: one non-blocking TCP link (host listens :7820, joiner connects).
-// Frame: [u16 len LE][payload]; payload = the melonDS bridge bundle.
-// ---------------------------------------------------------------------------
+// Transport: non-blocking TCP (host listens :7820). Frame = [u16 len LE][payload].
 namespace
 {
 
@@ -60,8 +43,7 @@ const int MP_PORT = 7820;
 const u32 MP_MAX_FRAME = 8192;
 const int MP_RELAY_PORT = 7833;   // default port of the PMRELAY1 relay server
 const u8  MP_WIRE_VER = 2;        // wire version: LAN beacon byte AND relay handshake (2 = 8-player rooms)
-// Community relay pre-filled in the online dialogs (reserved IP, survives
-// server migrations). A player-entered value in the ini always wins.
+// Default relay for the online dialogs; a saved custom value wins.
 const char* MP_DEFAULT_RELAY = "193.122.236.144:7833";
 
 // Hosting needs an inbound firewall rule; if ours is missing we ask, then add it with one admin prompt.
@@ -113,7 +95,6 @@ static void mpEnsureFirewall()
     static bool once = false;
     if (once) return;
     once = true;
-    if (getenv("MELONDS_AP")) return;   // automated harness instances: no prompts
 
     wchar_t exe[MAX_PATH];
     DWORD n = GetModuleFileNameW(NULL, exe, MAX_PATH);
@@ -167,13 +148,9 @@ struct MpNet
     int mode = 0;               // 0 off, 1 host, 2 join
     char joinIP[64] = "127.0.0.1";
     SOCKET listener = INVALID_SOCKET;
-    MpPeer peers[7];            // host: up to 3 clients (slot i = role 2+i);
-                                // join: peers[0] = the host link
+    MpPeer peers[7];            // host: slot i = role 2+i; join: peers[0] = the host link
     bool connecting = false;    // join: non-blocking connect in flight
-    bool freshPeer = false;     // a link just came up: pump must resend
-                                // on-change channels (party/pkt) — their
-                                // caches predate this peer, so it would
-                                // otherwise NEVER receive our party
+    bool freshPeer = false;     // a link just came up: resend party/pkt next pump
     u32 retryAt = 0;
     int assignedRole = 0;       // join: role handed out by the host (0xFF ctl frame)
     char myName[24] = "Player";
@@ -334,15 +311,7 @@ struct MpNet
         for (int i = 0; i < 7; i++) dropPeer(i);
     }
 
-    // =======================================================================
-    // Online relay mode (PMRELAY1) — see tools/relay/RELAY_PROTOCOL.md in the
-    // ROM repo.  Everyone dials OUT to a relay server; the relay splices host
-    // and joiner streams, so nobody port-forwards and players never see each
-    // other's IP.  After the short ASCII handshake, a spliced socket carries
-    // the normal game stream byte-for-byte — everything below the handshake
-    // (framing, role assignment, host relay, name/ping) is untouched.
-    // Outbound-only: no listener, no firewall prompt, no LAN beacon.
-    // =======================================================================
+    // Online relay mode (PMRELAY1): everyone dials out, the relay splices host and joiner into a normal game stream.
     int onlineMode = 0;             // 0 LAN/direct, 1 relay host, 2 relay join
     char relayDisp[160] = "";       // relay server as typed (display/config)
     sockaddr_in relayAddr;          // resolved once at start (UI/env thread)
@@ -369,8 +338,6 @@ struct MpNet
     int joinState = 0;              // 0 idle, 1 connecting, 2 await OK, 3 linked
     std::vector<u8> joinBuf;
     u32 joinRetryAt = 0, joinStartedAt = 0;
-    char codeFile[260] = "";        // MELONDS_AP_CODEFILE (host writes, joiner polls)
-    u32 codePollAt = 0;
 
     void setRelayStatus(const char* s)
     {
@@ -391,8 +358,7 @@ struct MpNet
         roomCode[n] = 0;
     }
 
-    // "host[:port]" -> relayAddr.  BLOCKING (getaddrinfo): call only from the
-    // UI click / env init, never from the per-frame tick.
+    // "host[:port]" -> relayAddr. Blocking DNS: call from the UI or env init only, never per frame.
     bool resolveRelay(const char* spec)
     {
         char hostpart[160];
@@ -455,17 +421,10 @@ struct MpNet
         onlineMode = 0; roomCode[0] = 0; relayStatus[0] = 0; relayFatal = false;
     }
 
-    // Drain s into buf and extract one '\n' line (CR stripped) into out.
-    // 1 = got a line, 0 = no full line yet, -1 = connection dead / junk.
-    // Bytes left in buf after the newline are GAME bytes (the relay's OK and
-    // the first spliced data can share a TCP segment) — the caller must carry
-    // them into the game receive buffer, never drop them.
+    // Read one line from the relay: 1 = line, 0 = none yet, -1 = dead. Bytes left in buf are game data: keep them.
     static int relayReadLine(SOCKET s, std::vector<u8>& buf, char* out, int outMax)
     {
-        // The relay's final "ERR <token>\n" and its close usually land in the
-        // SAME segment — a buffered line must be delivered BEFORE reporting
-        // the connection dead, or every terminal error (NOROOM/VERSION/FULL)
-        // reads as a retryable dropout and the client retries forever.
+        // Deliver a buffered line before reporting the socket dead (the relay sends ERR and closes together).
         bool dead = false;
         char tmp[4096];
         for (;;)
@@ -522,16 +481,6 @@ struct MpNet
         return ::send(s, line, n, 0) == n;   // tiny writes; partial = failure
     }
 
-    void writeCodeFile()
-    {
-        if (!codeFile[0] || !roomCode[0]) return;
-        FILE* f = fopen(codeFile, "wb");
-        if (!f) { printf("[BR] relay: cannot write code file %s\n", codeFile); return; }
-        fprintf(f, "%s\n", roomCode);
-        fclose(f);
-        printf("[BR] relay code written to %s\n", codeFile); fflush(stdout);
-    }
-
     void relayAccDrop(RelayAccept& a)
     {
         if (a.s != INVALID_SOCKET) closesocket(a.s);
@@ -559,7 +508,6 @@ struct MpNet
             _snprintf(st, sizeof(st), "room code %s - share it", roomCode);
             setRelayStatus(st);
             printf("[BR] relay room code: %s\n", roomCode); fflush(stdout);
-            writeCodeFile();
         }
         else if (!strncmp(line, "JOIN ", 5))
         {
@@ -567,11 +515,7 @@ struct MpNet
             int used = 0;
             for (int k = 0; k < 7; k++)
                 if (peers[k].up || peers[k].s != INVALID_SOCKET || racc[k].s != INVALID_SOCKET) used++;
-            if (used >= 7)   // 7 joiner slots (peers/racc are [7], roles 2..8) =
-                             // 8-player rooms.  Was a stale 3 (host + 3 = 4) that
-                             // the 8P widening missed: a bare literal, not tied to
-                             // an array bound or loop, so the [3]->[7] sweep skipped
-                             // it and DeSmuME-hosted online rooms capped at 4.
+            if (used >= 7)   // 7 joiner slots = 8-player rooms
             {
                 printf("[BR] relay: no free slot, ignoring ticket %u\n", ticket);
                 return;                  // ticket expires at the relay
@@ -673,8 +617,7 @@ struct MpNet
                     for (int k = 0; k < 7; k++)
                         if (!peers[k].up && peers[k].s == INVALID_SOCKET) { slot = k; break; }
                     if (slot < 0) { relayAccDrop(a); continue; }
-                    // install exactly like an accept()ed LAN client, leftover
-                    // bytes included (they are the head of the game stream)
+                    // install like an accepted LAN client; leftover bytes are the start of the game stream
                     MpPeer& p = peers[slot];
                     p.s = a.s; p.up = true;
                     p.rx.assign(a.buf.begin(), a.buf.end());
@@ -704,21 +647,6 @@ struct MpNet
 
     void relayJoinTick(u32 frame)
     {
-        // harness path: poll the code file (~1/s) until it has a code
-        if (!roomCode[0] && codeFile[0] && frame >= codePollAt)
-        {
-            codePollAt = frame + 60;
-            FILE* f = fopen(codeFile, "rb");
-            if (f)
-            {
-                char tmp[16]; memset(tmp, 0, sizeof(tmp));
-                fread(tmp, 1, sizeof(tmp) - 1, f);
-                fclose(f);
-                setRoomCode(tmp);
-                if ((int)strlen(roomCode) < 5) roomCode[0] = 0;
-                else { printf("[BR] relay code from file: %s\n", roomCode); fflush(stdout); }
-            }
-        }
         if (relayFatal || !roomCode[0]) return;
 
         if (joinState == 3)
@@ -853,8 +781,7 @@ struct MpNet
 
         if (mode == 1 && listener != INVALID_SOCKET)
         {
-            // accept into any free slot; slot i is role 2+i (stable across
-            // reconnects, so a rejoining player gets its old role back)
+            // slot i is role 2+i, so a rejoining player gets its old role back
             for (int i = 0; i < 7; i++)
             {
                 if (peers[i].up)
@@ -990,9 +917,7 @@ struct MpNet
 
 MpNet gNet;
 
-// ---------------------------------------------------------------------------
-// Bridge pump state (verbatim melonDS BridgeSt)
-// ---------------------------------------------------------------------------
+// Bridge pump state
 struct BridgeSt
 {
     bool armed = false;         // env said host/join
@@ -1006,15 +931,7 @@ struct BridgeSt
     std::vector<u8> lastParty, lastPkt;
     u32 dbgTx = 0, dbgRx = 0, dbgPktTx = 0, dbgPktRx = 0;
 
-    /* Freshness-tracked peer roles, TWO tiers:
-     *  - roleSeenAt: LOBBY presence — stamped by name frames (0xFE) too, so
-     *    the roster shows players the moment they connect. Drives the lobby
-     *    UI and the discovery beacon only.
-     *  - gameSeenAt: IN-GAME presence — stamped ONLY when a game-data bundle
-     *    (tag 1/2/3) from role r arrives, i.e. that player actually activated
-     *    Wireless Play. Drives the ROM-visible peerMask/status; without the
-     *    split, a player idling in the lobby made the game flash "wireless
-     *    connected" the instant the local player activated. */
+    // roleSeenAt = lobby presence (roster, beacon); gameSeenAt = in-game presence (what the ROM sees).
     u32 roleSeenAt[9] = {};
     u32 gameSeenAt[9] = {};
 
@@ -1031,43 +948,11 @@ struct BridgeSt
 };
 BridgeSt gBr;
 
-// ---------------------------------------------------------------------------
-// Autopilot state (port of the melonDS ap* namespace)
-// ---------------------------------------------------------------------------
-int apMode = -1;                // -1 off, 0 host, 1 join
-int apHold = 0;
-int patMode = 0;                // 0 walk, 1 run, 2 circle, 3 waggle, 4 ugclient, 5 ughost
-u32 apFrame = 0;
-u32 apConnFrame = 0;
-int apInField = 0;
-u32 apFieldFC = 0;
-u32 apTouchFrames = 0;          // scripted stylus press countdown (seamwalk pattern)
-FILE* apCsv = NULL;
-
-// --- input record / replay (patMode 10 = record, 11 = replay) -------------
-// Frame-accurate button capture.  Record logs the user's real pad each frame
-// on-change; replay forces the same bits back.  Both anchor at field entry
-// (apInField) so boot/connect timing differences wash out — so the replay
-// instance must start from the SAME save/state as the recording.  Mask bit
-// layout matches the press mask below: A0 B1 sel2 start3 R4 L5 U6 D7 X10 Y11.
-struct ApRepEntry { u32 f; u32 mask; };
-static const int AP_REP_MAX = 65536;
-ApRepEntry apRepTab[AP_REP_MAX];
-int   apRepCount = 0, apRepIdx = 0;
-u32   apRepMask = 0, apAnchorFrame = 0, apRecLastMask = 0xFFFFFFFFu;
-FILE* apRecFile = NULL;
-int   apRecStarted = 0;
-
 } // namespace
 
 // ---------------------------------------------------------------------------
 
-// ===========================================================================
-// Win32 LAN lobby: Multiplayer menu -> Host / Join dialogs (name entry +
-// auto-find list + direct IP) -> a modeless lobby window showing the player
-// roster.  Drives the same TCP bridge as env, so it interoperates with the
-// melonDS and BizHawk forks.  main.cpp forwards 3 messages.
-// ===========================================================================
+// Win32 lobby: Multiplayer menu, Host / Join dialogs, and the roster window.
 namespace {
 enum { MP_ID_HOST = 0xE100, MP_ID_JOIN, MP_ID_STOP, MP_ID_HOSTON, MP_ID_JOINON, MP_ID_RELAYCFG };
 HMENU gMpMenu = NULL;
@@ -1284,9 +1169,7 @@ bool ShowJoinDialog(HWND parent)
     return DialogBoxIndirectParamA(GetModuleHandle(NULL), (LPCDLGTEMPLATEA)buf, parent, JoinProc, 0) == 1;
 }
 
-// --- online (relay) dialogs: name (+ code for join). The relay-server text
-// box is HIDDEN unless the "Custom Relay Server" menu option is checked —
-// the baked default (or a previously saved custom value) is used silently.
+// Online dialogs. The relay field shows only when "Custom Relay Server" is checked.
 static char gDlgRelay[160];
 static char gDlgCode[16];
 static bool gShowRelayField = false;
@@ -1311,8 +1194,7 @@ void mpLoadRelayPref()
 }
 void mpSaveRelayPref(const char* v)
 {
-    // Storing the baked default would pin it in the ini and shadow any future
-    // default we ship — persist only CUSTOM values, clear the key otherwise.
+    // Save only a custom relay; storing the default would shadow future defaults.
     if (!strcmp(v, MP_DEFAULT_RELAY))
         WritePrivateProfileStringA("ProjectPM", "RelayServer", NULL, IniName);
     else
@@ -1522,76 +1404,12 @@ bool MpBridge_HandleCommand(unsigned int id)
     return false;
 }
 
-void MpBridge_InitFromEnv()
-{
-    const char* e = getenv("MELONDS_AP");     // name kept for harness compat
-    if (!e) return;
-    if (!strcmp(e, "host")) { apMode = 0; gNet.mode = 1; }
-    else if (!strcmp(e, "join")) { apMode = 1; gNet.mode = 2; }
-    else return;
-
-    const char* ip = getenv("MELONDS_AP_IP");
-    if (ip) { strncpy(gNet.joinIP, ip, sizeof(gNet.joinIP) - 1); gNet.joinIP[sizeof(gNet.joinIP)-1] = 0; }
-    apHold = getenv("MELONDS_AP_HOLD") ? 1 : 0;
-    const char* pat = getenv("MELONDS_AP_PATTERN");
-    patMode = (!pat) ? 0 : (!strcmp(pat, "run")) ? 1
-            : (!strcmp(pat, "circle")) ? 2
-            : (!strcmp(pat, "waggle")) ? 3
-            : (!strcmp(pat, "ugclient")) ? 4
-            : (!strcmp(pat, "ughost")) ? 5
-            : (!strcmp(pat, "startercrash")) ? 6
-            : (!strcmp(pat, "seamwalk")) ? 7
-            : (!strcmp(pat, "challenge")) ? 8
-            : (!strcmp(pat, "live")) ? 9
-            : (!strcmp(pat, "record")) ? 10
-            : (!strcmp(pat, "replay")) ? 11 : 0;
-
-    const char* nm = getenv("MELONDS_AP_NAME");
-    if (nm) gNet.setName(nm);
-    const char* cfile = getenv("MELONDS_AP_CODEFILE");
-    if (cfile)
-    {
-        strncpy(gNet.codeFile, cfile, sizeof(gNet.codeFile) - 1);
-        gNet.codeFile[sizeof(gNet.codeFile) - 1] = 0;
-    }
-
-    gBr.armed = true;
-    const char* relay = getenv("MELONDS_AP_RELAY");
-    if (relay)
-    {
-        // online relay mode (harness): host gets a code (writes MELONDS_AP_
-        // CODEFILE); joiner uses MELONDS_AP_CODE or polls the code file.
-        const char* code = getenv("MELONDS_AP_CODE");
-        bool ok = (gNet.mode == 1) ? gNet.startHostOnline(relay)
-                                   : gNet.startJoinOnline(relay, code ? code : "");
-        if (!ok) { printf("[BR] relay address unresolvable: %s\n", relay); fflush(stdout); }
-    }
-    else if (gNet.mode == 1) gNet.startHost();
-    else gNet.start();
-    printf("[BR] armed: %s pattern=%d\n", (apMode == 0) ? "host" : "join", patMode);
-    fflush(stdout);
-}
-
 void MpBridge_Shutdown()
 {
     gNet.shutdownAll();
-    if (apCsv) { fclose(apCsv); apCsv = NULL; }
-    if (apRecFile) { fclose(apRecFile); apRecFile = NULL; }
 }
 
-// ---------------------------------------------------------------------------
-// Per-frame pump — melonDS BridgePump ported.
-// ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
-// Alarm-corruption tripwire.  The seam freeze was a wild thumb-jump in the
-// IRQ handler: an ARMED OSAlarm's handler pointer got overwritten (with what
-// looked like 15-bit colour data) and the alarm then fired.  The ROM exports
-// &OSi_AlarmQueue at ctl+16; every frame we walk the queue, learn the armed
-// alarm structs (they are stable allocations), and watch queue + structs.
-// The core's write paths call MpWatch_OnWrite for EVERY CPU/DMA write while
-// armed (see lua-engine.h); writes from outside the SDK library region get
-// logged with the writing PC — the scribbler, caught red-handed.
-// ---------------------------------------------------------------------------
+// Debug tripwire: logs writes into the SDK alarm structures that come from outside the SDK code.
 bool gMpWatchArmed = false;
 struct MpWatchRange { u32 lo, hi; };
 static MpWatchRange sWatchRanges[20];
@@ -1623,15 +1441,9 @@ void MpWatch_OnWrite(unsigned int address, int size, unsigned int value)
         if (address >= sWatchRanges[i].lo && address < sWatchRanges[i].hi)
         {
             u32 pc9 = NDS_ARM9.instruct_adr;
-            // The SDK libraries legitimately maintain their own statics
-            // (queue ops, thread saves, card state) — only FOREIGN writers
-            // matter.  The table watch is the exception: there we want EVERY
-            // writer's PC, engine code included.
+            // SDK code may write here; only foreign writers matter (the table watch logs everyone).
             if (i != sTableRange && pc9 >= 0x020CF000 && pc9 < 0x020DF000) return;
-            // Dedupe on (PC, 16-byte bucket): game callbacks running on the
-            // card/sound threads write their stack frames in-band constantly;
-            // one line per distinct writer+target keeps the log readable
-            // without losing the one write that matters.
+            // one log line per (PC, 16-byte bucket)
             {
                 static u32 sSeenPC[192], sSeenAddr[192];
                 static int sSeenN = 0;
@@ -1656,11 +1468,7 @@ void MpBridge_Pump()
 
     gNet.tick(gBr.frame);
 
-    // A peer link just came up: drop the on-change send caches so the next
-    // pump resends party/pkt to everyone.  Without this a peer connecting
-    // AFTER our first send NEVER received our party — the receiving side's
-    // battle/trade launch waits on partner party bytes forever ("the
-    // accepter never gets the message").
+    // A peer link just came up: clear the send caches so party/pkt are resent.
     if (gNet.freshPeer)
     {
         gNet.freshPeer = false;
@@ -1668,10 +1476,7 @@ void MpBridge_Pump()
         gBr.lastPkt.clear();
     }
 
-    // ROM discovery: scan periodically until found. Must NOT gate the
-    // transport exchange below — the lobby connects at the title screen,
-    // long before the game runs Multiplayer_Update()/InitDiscovery() in the
-    // overworld and publishes the discovery block.
+    // Find the ROM's discovery block. Must not gate the transport: the lobby connects at the title screen.
     if (!gBr.disc && (gBr.frame % 60) == 0)
     {
         for (u32 off = 0; off < 0x400000 - 16; off += 4)
@@ -1707,8 +1512,7 @@ void MpBridge_Pump()
         apWr8(gBr.ctl + 6, ++gBr.beat);   // fork heartbeat
     }
 
-    // LAN beacon: LAN hosting only. An online room is not joinable via LAN,
-    // so advertising it would just mislead the browse list.
+    // LAN beacon: LAN hosting only (an online room is not joinable over LAN).
     if (gNet.mode == 1 && !gNet.onlineMode && (gBr.frame - gNet.lastBeacon) >= 60) {
         gNet.lastBeacon = gBr.frame;
         gNet.beaconBroadcast((u8)(gBr.FreshPeerMask(gNet.myRole()) ? 2 : 1));
@@ -1729,10 +1533,7 @@ void MpBridge_Pump()
         && gBr.partySize != 0 && gBr.partySize <= 2048
         && gBr.pktSize != 0 && gBr.pktSize <= 2048);
 
-    // NOTE: no early-return when the ROM side isn't up yet. The lobby connects
-    // and exchanges name/ping frames at the title screen, so the recv loop
-    // below must run every armed frame or joined players never appear in the
-    // lobby roster. Everything touching ROM RAM is gated on romUp/inGame.
+    // No early return while the ROM is not up: the lobby still needs the receive loop below.
     if (romUp)
     {
         apWr8(gBr.ctl + 8, (u8)myRole);
@@ -1838,9 +1639,7 @@ void MpBridge_Pump()
             if (!gNet.roleAllowed(pi, r)) continue;
             if (n < 4 + sz) continue;
 
-            // Host relay: clients only reach the host — forward every client
-            // bundle to the other clients so they see EACH OTHER (the origin
-            // ignores its own echo via the r == myRole check).
+            // Host relay: forward each client's bundle to the other clients.
             if (myRole == 1)
                 for (int pj = 0; pj < 7; pj++)
                     if (pj != pi) gNet.enqueue(pj, rx, n);
@@ -1848,9 +1647,7 @@ void MpBridge_Pump()
             gBr.roleSeenAt[r] = gBr.frame;
             if (tag >= 1 && tag <= 3)
             {
-                // Peer NEWLY game-active (just activated Wireless Play, or
-                // reconnected): resend our on-change channels — anything we
-                // sent before this moment predates their readiness.
+                // Peer newly in game: resend our party/pkt.
                 bool wasFresh = gBr.gameSeenAt[r] != 0 && gBr.frame - gBr.gameSeenAt[r] <= 180;
                 if (!wasFresh)
                 {
@@ -1860,47 +1657,18 @@ void MpBridge_Pump()
                 gBr.gameSeenAt[r] = gBr.frame;
             }
 
-            // Game-mailbox apply whenever the ROM's discovery block is up
-            // (romUp) — NOT gated on our own activation: the mailboxes are
-            // inert BSS until the ROM activates, and dropping pre-activation
-            // frames LOST the peer's one-shot on-change party send when they
-            // activated before us (the accepter never activated: its battle/
-            // trade launch waits on partner party bytes forever).
-            //
-            // LEGACY-CHANNEL PAIR ROUTING (3+ players): the single pairwise
-            // import block / party buffer must only receive the CHOSEN pair
-            // partner's data — the ROM publishes its intent in the OW export
-            // (pairRole @ +0x18; 0 = unpaired, keep first-come legacy
-            // behaviour).  Without this every peer's bundle overwrote the
-            // legacy block (last writer wins) and battle/trade/give requests
-            // "broadcast" to every player.  Per-role arrays always update.
+            // Apply whenever the ROM is up. The pairwise import only takes the chosen partner (pairRole).
             if (romUp && tag == 1 && sz == gBr.blkSize && n >= 4 + sz + 48)
             {
                 u8 pairRole = apRd8(gBr.owExp + 0x18);
-                // STRICT 3+ ROUTING (4P same-trainer fix): with two or more
-                // game-active peers, the legacy pairwise import only ever
-                // receives the CHOSEN partner (r == pairRole).  The old
-                // "pairRole 0 accepts everyone, last writer wins" open door
-                // is 2P protocol -- but in a 4P session it let a MID-BATTLE
-                // pair's per-turn block broadcasts (same trainerHash!) land
-                // in a still-unpaired third player's import during their
-                // entry stall, so P3 converted/synced against P1 instead of
-                // waiting for P4.  Unpaired in 3+ now receives nothing and
-                // simply keeps stalling for the real partner.
-                // Peer count for strictness: lobby-fresh (heartbeats keep
-                // roleSeenAt alive even mid-battle) AND has ever been
-                // game-active.  GamePeerMask aged out mid-battle (frozen
-                // exports stop game traffic), silently re-opening the door
-                // exactly while P1+P2 fought -- the war-zone imports that
-                // starved P3+P4's conversion (2026-07-23 4P trace).
+                // With 2+ game peers the pairwise import is strict: only the chosen partner, never "first come".
                 int gamePeers = 0;
                 for (int gb = 1; gb <= 8; gb++)
                     if (gb != myRole && gBr.roleSeenAt[gb] != 0
                         && gBr.frame - gBr.roleSeenAt[gb] <= 300
                         && gBr.gameSeenAt[gb] != 0) gamePeers++;
                 bool strict = (gamePeers >= 2);
-                rx[4 + 0x12] = (u8)r;   // stamp playerRole (the old hub did this;
-                                        // MpPartnerIsLead is dead without it)
+                rx[4 + 0x12] = (u8)r;   // stamp the sender's role into the block
                 if ((pairRole == 0 && !strict) || r == (int)pairRole)
                     memcpy(apPtr(gBr.importBlk), rx + 4, sz);
                 if (gBr.blkN) memcpy(apPtr(gBr.blkN + (r-1)*sz), rx + 4, sz);
@@ -1927,16 +1695,7 @@ void MpBridge_Pump()
         }
     }
 
-    // PAIR REBIND / GHOST PURGE.  On a pairRole change to a REAL role, replay
-    // that role's latest cached block/party from the always-updated per-role
-    // arrays so the pair is instantly consistent.  A change to 0 is left
-    // ALONE: the ROM's pair re-validate briefly flaps pairRole to 0 when the
-    // partner's conversion window closes (published trainerHash drops for a
-    // tick) and re-courts mutually the next scan tick -- zeroing here killed
-    // the P3+P4 conversion mid-handshake (2026-07-23 regression).  The stale
-    // ex-partner hazard is handled where it actually bites: when OUR OWN
-    // battle ends (export inBattle 1->0), the import's magic dies so a
-    // frozen mid-battle partner block can't convert a LATER battle.
+    // pairRole changed to a real role: replay that role's cached block and party. A change to 0 is ignored (it flaps).
     if (romUp && gBr.owExp && gBr.importBlk)
     {
         static u8 sLastPairRole = 0xFF;
@@ -1964,9 +1723,7 @@ void MpBridge_Pump()
 
     if (inGame)
     {
-        // GAME peer mask, not the lobby one: "connected" must mean the peer
-        // is actually streaming game data (activated Wireless Play), not
-        // merely sitting in the lobby.
+        // Game peer mask, not the lobby one: "connected" means the peer is sending game data.
         u8 pm = gBr.GamePeerMask(myRole);
         apWr8(gBr.ctl + 7, pm ? 2 : 1);   // status
         apWr8(gBr.ctl + 9, pm);           // peerMask
@@ -1980,8 +1737,7 @@ void MpBridge_Pump()
         fflush(stdout);
     }
 
-    // ALWAYS-ON crash catcher: overworld frame counter frozen while a session
-    // is wanted => the ARM9 is wedged/crashed; dump registers for the map.
+    // Crash catcher: overworld frame counter frozen during a session, so dump the ARM9 registers.
     if (romUp)
     {
         static u32 ccLastFC = 0, ccChangedAt = 0;
@@ -2026,10 +1782,7 @@ void MpBridge_Pump()
     // ---- alarm tripwire maintenance: learn queue + armed structs, verify ----
     if (romUp && gBr.ctl)
     {
-        // ctl+16 = a literal from OS_InitAlarm's pool: lands somewhere in the
-        // OSi alarm BSS cluster (UseAlarm flag / queue head / valarm are
-        // adjacent words).  Watch the whole neighbourhood; resolve the exact
-        // queue head by probing for a word that behaves like one.
+        // ctl+16 points into the OS alarm statics; watch the area and find the queue head in it.
         u32 w = apRd32(gBr.ctl + 16);
         if (w >= 0x02000000 && w < 0x02400000)
         {
@@ -2044,11 +1797,7 @@ void MpBridge_Pump()
                 sWatchRanges[sWatchCount].lo = lo;
                 sWatchRanges[sWatchCount].hi = lo + 0x48;
                 sWatchCount++;
-                // The whole SDK-statics band: sound arena through the card
-                // library's common block (cardi_common holds the TRANSIENT
-                // card alarm that is armed exactly during seam card reads —
-                // the freeze victim's neighbourhood).  Positioned relative to
-                // the exported literal so ROM rebuilds keep working.
+                // Also watch the wider SDK statics band around it.
                 sWatchRanges[sWatchCount].lo = (w > 0x02002600) ? (w - 0x2600) : 0x02000000;
                 sWatchRanges[sWatchCount].hi = w + 0x2800;
                 sWatchCount++;
@@ -2056,9 +1805,7 @@ void MpBridge_Pump()
                 MpWatchLog("ARMED role=%d f=%u cluster=%08X..%08X band=%08X..%08X (lit=%08X)\n",
                     myRole, gBr.frame, lo, lo + 0x48,
                     sWatchRanges[1].lo, sWatchRanges[1].hi, w);
-                // Optional extra watch: "addr len" (hex) in mp_table_watch.txt
-                // next to the exe — logs EVERY writer to that range with its
-                // PC (the gfx entry-table biography for the shadow hunt).
+                // Optional extra watch range from mp_table_watch.txt ("addr len" in hex).
                 {
                     FILE* tf = fopen("mp_table_watch.txt", "r");
                     if (tf) {
@@ -2076,8 +1823,7 @@ void MpBridge_Pump()
                     }
                 }
             }
-            // Resolve the live queue head: a word in the cluster holding a
-            // pointer to a sane-looking OSAlarm (handler word inside code).
+            // The queue head is a word here that points at a plausible OSAlarm.
             static u32 sResolvedHead = 0;
             if (!sResolvedHead)
             {
@@ -2117,8 +1863,7 @@ void MpBridge_Pump()
                 }
                 node = apRd32(node + 0x18);   // OSAlarm.next
             }
-            // Content sentinel (JIT-miss backup): a remembered struct's handler
-            // must never change to garbage while we watch.
+            // A remembered alarm's handler must not change while we watch.
             for (int i = 0; i < sWatchNodeCount; i++)
             {
                 u32 h = apRd32(sWatchNodes[i]);
@@ -2133,389 +1878,3 @@ void MpBridge_Pump()
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Autopilot input — melonDS apApply ported onto UserInput.
-// press bits follow the melonDS numbering: 0=A 1=B 2=Select 3=Start
-// 4=Right 5=Left 6=Up 7=Down 10=X 11=Y.
-// ---------------------------------------------------------------------------
-void MpAp_OverrideInput()
-{
-    if (apMode < 0) return;
-    apFrame++;
-
-    u32 press = 0;
-
-    // ---- boot script: A through title/continue until the field runs ----
-    // Suppressed under MELONDS_AP_HOLD so the operator can drive the load/menu
-    // by hand (e.g. the "on my command" replay setup).
-    if (apFrame >= 700 && apFrame < 2000 && !apInField && !apHold)
-    {
-        if ((apFrame % 40) < 8) press |= (1 << 0);
-    }
-    else if (!apHold && apFrame == 2120 && gBr.disc)
-    {
-        // debug-inbox activation (cmd 19): the SELECT shortcut is gone —
-        // in-game activation lives on the "Wireless Play" bag item now.
-        // Runs in LIVE mode too so a 2-instance session auto-connects; a
-        // solo live instance just searches harmlessly.
-        u32 inbox = apRd32(gBr.disc + 17*4);
-        if (inbox)
-        {
-            apWr32(inbox + 12, 19);
-            apWr32(inbox + 16, 1);
-            apWr32(inbox + 4, apRd32(inbox + 8) + 1);
-        }
-    }
-
-    // ---- LIVE INPUT (patMode 9): on-demand button presses from a command
-    // file, so an operator can drive this instance one step at a time.
-    // ROLE-AWARE: host reads mp_live_p1.txt, join reads mp_live_p2.txt (both
-    // instances share a cwd, so each must read its own).  One line:
-    //   <seq> <btn> <frames>
-    // btn is one of U D L R A B X Y S(tart) T(select).  A NEW seq starts a
-    // fresh hold for <frames> frames.  Re-read a few times/sec (cheap). ----
-    if (patMode == 9)
-    {
-        static int  liveSeq = -1;
-        static int  liveFramesLeft = 0;
-        static u32  liveBit = 0;
-        if ((apFrame & 3) == 0)
-        {
-            const char* lfn = (apMode == 0) ? "mp_live_p1.txt" : "mp_live_p2.txt";
-            FILE* lf = fopen(lfn, "r");
-            if (lf)
-            {
-                int seq = 0, frames = 0; char btn = 0;
-                if (fscanf(lf, "%d %c %d", &seq, &btn, &frames) == 3 && seq != liveSeq)
-                {
-                    liveSeq = seq;
-                    liveFramesLeft = (frames > 0 && frames < 600) ? frames : 1;
-                    switch (btn)
-                    {
-                        case 'A': liveBit = (1u << 0);  break;
-                        case 'B': liveBit = (1u << 1);  break;
-                        case 'T': liveBit = (1u << 2);  break;  // Select
-                        case 'S': liveBit = (1u << 3);  break;  // Start
-                        case 'R': liveBit = (1u << 4);  break;  // d-pad Right
-                        case 'L': liveBit = (1u << 5);  break;  // d-pad Left
-                        case 'U': liveBit = (1u << 6);  break;
-                        case 'D': liveBit = (1u << 7);  break;
-                        case 'X': liveBit = (1u << 10); break;
-                        case 'Y': liveBit = (1u << 11); break;
-                        default:  liveBit = 0;          break;
-                    }
-                }
-                fclose(lf);
-            }
-        }
-        if (liveFramesLeft > 0)
-        {
-            press |= liveBit;
-            liveFramesLeft--;
-        }
-    }
-
-    if (gBr.disc)
-    {
-        u32 pOwExp = gBr.owExp;
-        u32 pDiag = apRd32(gBr.disc + 30*4);
-        // IN-GAME session mask (wm-diag peerMask), NOT the TCP link state:
-        // patterns must wait for "Activate Multiplayer" to have completed.
-        // (Latching on gNet.peerMask() fired at the title screen and ran the
-        // whole script against a solo session.)
-        u8 peerMask = pDiag ? apRd8(pDiag + 7) : 0;
-
-        // field detection: overworld frameCounter advancing == in-field
-        if (!apInField)
-        {
-            u32 fc = apRd32(pOwExp + 0x0C);
-            if (fc != 0 && apFieldFC != 0 && fc != apFieldFC) apInField = 1;
-            apFieldFC = fc;
-        }
-
-        if (!apConnFrame && peerMask)
-        {
-            apConnFrame = apFrame;
-            printf("[AP] connected at frame %u\n", apFrame);
-            fflush(stdout);
-        }
-
-        if (apConnFrame && !apHold)
-        {
-            u32 cf = apFrame - apConnFrame;
-            u32 winLo = (apMode == 0) ? 300u : 1700u;
-            u32 winHi = (apMode == 0) ? 1500u : 2900u;
-
-            if (patMode == 4 || patMode == 5)
-            {
-                // Underground leave/re-enter repro (the manual recipe):
-                //   both: Y (registered Explorer Kit) then A every 1s x30 -> descend
-                //   leaver only: X menu, Down x5, A x4 (2s apart) -> "Go up"
-                //   wait ~15s, then Y + A every 1s x30 -> descend again
-                // ugclient: the JOIN instance leaves; ughost: the HOST leaves.
-                bool leaver = (patMode == 4) ? (apMode == 1) : (apMode == 0);
-                // 4-player: extra joiners set MELONDS_AP_NOLEAVE=1 and stand.
-                static int apNoLeave = -1;
-                if (apNoLeave < 0) apNoLeave = getenv("MELONDS_AP_NOLEAVE") ? 1 : 0;
-                if (apNoLeave) leaver = false;
-
-                if (cf >= 300 && cf < 308)
-                    press |= (1u << 11);                                   // Y: Explorer Kit
-                else if (cf >= 360 && cf < 360 + 30*60 && ((cf - 360) % 60) < 8)
-                    press |= (1u << 0);                                    // A x30 (1/s)
-
-                if (leaver)
-                {
-                    const u32 L = 2400;                                    // below by now
-                    const u32 R = L + 240 + 4*120 + 900;                   // after up + ~15s
-                    if (cf >= L && cf < L + 8)
-                        press |= (1u << 10);                               // X: menu
-                    else if (cf >= L + 60 && cf < L + 60 + 5*24 && ((cf - L - 60) % 24) < 8)
-                        press |= (1u << 7);                                // Down x5
-                    else if (cf >= L + 240 && cf < L + 240 + 4*120 && ((cf - L - 240) % 120) < 8)
-                        press |= (1u << 0);                                // A x4 (2s apart)
-                    else if (cf >= R && cf < R + 8)
-                        press |= (1u << 11);                               // Y again
-                    else if (cf >= R + 60 && cf < R + 60 + 30*60 && ((cf - R - 60) % 60) < 8)
-                        press |= (1u << 0);                                // A x30: re-descend
-                }
-            }
-            else if (patMode <= 3 && cf >= winLo && cf < winHi)
-            {
-                // Default wander patterns (0 walk / 1 run / 2 circle / 3
-                // waggle) ONLY.  Was ungated, so it shadowed the scripted
-                // patterns 6/7/8 during the window -> host wandered L/R, join
-                // wandered U/D, and the real recipe never ran.
-                if (patMode == 3)
-                {
-                    u32 pc = (cf - winLo) % 510;
-                    int bitA = (apMode == 0) ? 5 : 6;
-                    int bitB = (apMode == 0) ? 4 : 7;
-                    if (pc < 240)
-                    {
-                        press |= (1 << 1);
-                        press |= (1 << (((pc / 8) & 1) ? bitA : bitB));
-                    }
-                    else if (pc < 420)
-                    {
-                        press |= (1 << 1);
-                        press |= (1 << ((((cf - winLo) / 510) & 1) ? bitB : bitA));
-                    }
-                }
-                else if (patMode == 2)
-                {
-                    static const int circleBit[4] = { 4, 7, 5, 6 };
-                    press |= (1 << 1);
-                    press |= (1 << circleBit[(cf / 32) & 3]);
-                }
-                else
-                {
-                    if (patMode == 1) press |= (1 << 1);
-                    if (apMode == 0)
-                        press |= (1 << (((cf / 90) & 1) ? 5 : 4));
-                    else
-                        press |= (1 << (((cf / 90) & 1) ? 7 : 6));
-                }
-            }
-            else if (patMode == 6)
-            {
-                // STARTER-CRASH repro (user recipe): both saves sit AT the
-                // briefcase scene.  Once connected, P1 (host) presses A once
-                // a second for ~10s to advance into starter select; P2 idles.
-                if (apMode == 0 && cf >= 300 && cf < 300 + 10*60 && ((cf - 300) % 60) < 8)
-                    press |= (1u << 0);                                    // A
-            }
-            else if (patMode == 7)
-            {
-                // SEAM-WALK repro (user recipe), made DETERMINISTIC.  The
-                // options-menu navigation was fragile (start-menu layout
-                // varies -> Down x4 missed Options -> no swap, just walking).
-                // Instead P1 swaps its appearance straight through the debug
-                // inbox (cmd 20 = set appearance byte) to HILBERT (type 8) --
-                // a known shadow-prone native-model character -- then P2
-                // steps one tile UP through the seam and one tile back DOWN.
-                if (apMode == 0)
-                {
-                    static int apSwapSent = 0;
-                    if (cf >= 600 && !apSwapSent && gBr.disc)
-                    {
-                        u32 inbox = apRd32(gBr.disc + 17 * 4);
-                        if (inbox)
-                        {
-                            apWr32(inbox + 12, 20);        // cmd 20 = set appearance
-                            apWr32(inbox + 16, 0x81);      // Hilbert (type 8), colour 1
-                            apWr32(inbox + 4, apRd32(inbox + 8) + 1);  // seq = ackSeq+1
-                            apSwapSent = 1;
-                            printf("[AP] seam: appearance swap -> Hilbert sent at cf=%u\n", cf);
-                            fflush(stdout);
-                        }
-                    }
-                }
-                else
-                {
-                    // Walk DECISIVELY across the seam and a few tiles beyond so
-                    // P2 settles clearly on the new map (not straddling the
-                    // boundary, which oscillated the map header ~16x and never
-                    // let the partner settle).  Long single hold, stop, hold
-                    // back.  ~72 frames ~= 4-5 tiles (walls just stop us).
-                    if (cf >= 1100 && cf < 1172)        press |= (1u << 6);    // Up x~5 (cross + settle)
-                    else if (cf >= 1600 && cf < 1672)   press |= (1u << 7);    // Down x~5 (back + settle)
-                }
-            }
-            else if (patMode == 8)
-            {
-                // BANNER-REFRESH repro (user recipe): both instances boot the
-                // SAME pokeplatinumtest save, so they start ON THE SAME TILE
-                // already facing DOWN.  P2 steps one tile DOWN -> lands right
-                // in front of P1 (P1 is already facing down, no turn needed).
-                // P1 presses A three times -> partner menu -> Battle,
-                // challenging P2.  P2 (join, role 2) is the ACCEPTER whose
-                // "<name> has challenged you!" banner refreshes.
-                if (apMode == 1)
-                {
-                    // brief tap: already facing down, so ~7 frames = exactly
-                    // ONE step (24 frames over-shot and left the house).
-                    if (cf >= 300 && cf < 307)          press |= (1u << 7);    // P2: Down one tile
-                    // AFTER the challenge lands (~cf 700), walk left/right in
-                    // place -- the reported refresh only happens while the
-                    // accepter MOVES, so this exercises it for the diag.
-                    else if (cf >= 800)                 press |= (1u << (((cf / 30) & 1) ? 5 : 4)); // L/R
-                }
-                else
-                {
-                    if (cf >= 500 && cf < 508)          press |= (1u << 0);    // A: open partner menu
-                    else if (cf >= 580 && cf < 588)     press |= (1u << 0);    // A: Battle
-                    else if (cf >= 660 && cf < 668)     press |= (1u << 0);    // A: confirm/extra
-                }
-            }
-        }
-
-        // telemetry CSV
-        if (!apCsv)
-        {
-            char name[64];
-            snprintf(name, sizeof(name), "desmume_ap_%s.csv", (apMode == 0) ? "host" : "join");
-            apCsv = fopen(name, "w");
-            if (apCsv) fprintf(apCsv, "frame,peerMask,ownX,ownZ,ownFC,i0FC,i1FC\n");
-        }
-        if (apCsv && gBr.owExp && gBr.owImp)
-        {
-            fprintf(apCsv, "%u,%u,%d,%d,%u,%u,%u\n",
-                apFrame, peerMask,
-                apRd16s(gBr.owExp + 4), apRd16s(gBr.owExp + 6), apRd32(gBr.owExp + 0x0C),
-                apRd32(gBr.owImp + 0x0C), apRd32(gBr.owImp + 48 + 0x0C));
-            if ((apFrame & 255) == 0) fflush(apCsv);
-        }
-
-        // per-role hang sampler (game FC frozen while connected)
-        {
-            static u32 lastFC = 0, lastChangeAt = 0, dumped = 0;
-            u32 fcNow = apRd32(pOwExp + 0x0C);
-            if (fcNow != lastFC) { lastFC = fcNow; lastChangeAt = apFrame; dumped = 0; }
-            else if (apConnFrame && apFrame - lastChangeAt > 180 && dumped < 64)
-            {
-                char hn[64];
-                snprintf(hn, sizeof(hn), "desmume_hangpc_%s.txt", (apMode == 0) ? "host" : "join");
-                FILE* hf = fopen(hn, "a");
-                if (hf)
-                {
-                    fprintf(hf, "f=%u FCstuck=%u R15=%08X R14=%08X R13=%08X R12=%08X CPSR=%08X\n",
-                        apFrame, fcNow,
-                        NDS_ARM9.instruct_adr, NDS_ARM9.R[14], NDS_ARM9.R[13], NDS_ARM9.R[12],
-                        NDS_ARM9.CPSR.val);
-                    fclose(hf);
-                    dumped++;
-                }
-            }
-        }
-    }
-
-    // ---- INPUT RECORD (patMode 10) / REPLAY (patMode 11) ----------------
-    // Record auto-arms at overworld entry and logs the user's real pad
-    // on-change.  Replay instead waits for an operator go-signal file
-    // (mp_replay_go.txt) and then plays the recording from the character's
-    // CURRENT position -- the operator loads the save + connects by hand first
-    // (MELONDS_AP_HOLD suppresses auto-boot/-connect), so playback never fights
-    // that setup.  The go file is one-shot (removed on trigger).
-    if (patMode == 10 && apInField)
-    {
-        if (!apRecStarted)
-        {
-            apRecStarted = 1; apAnchorFrame = apFrame;
-            apRecFile = fopen("mp_record.txt", "w"); apRecLastMask = 0xFFFFFFFFu;
-            printf("[AP] recording input -> mp_record.txt\n"); fflush(stdout);
-        }
-        u32 ff = apFrame - apAnchorFrame;
-        UserInput& uin = NDS_getProcessingUserInput();
-        u32 mask = 0;
-        if (uin.buttons.A) mask |= (1u << 0);
-        if (uin.buttons.B) mask |= (1u << 1);
-        if (uin.buttons.T) mask |= (1u << 2);
-        if (uin.buttons.S) mask |= (1u << 3);
-        if (uin.buttons.R) mask |= (1u << 4);
-        if (uin.buttons.L) mask |= (1u << 5);
-        if (uin.buttons.U) mask |= (1u << 6);
-        if (uin.buttons.D) mask |= (1u << 7);
-        if (uin.buttons.X) mask |= (1u << 10);
-        if (uin.buttons.Y) mask |= (1u << 11);
-        if (apRecFile && mask != apRecLastMask)
-        { fprintf(apRecFile, "%u %u\n", ff, mask); fflush(apRecFile); apRecLastMask = mask; }
-        return;   // record never overrides the user's live input
-    }
-    else if (patMode == 11)
-    {
-        if (!apRecStarted)
-        {
-            if ((apFrame & 7) == 0)   // poll the go-signal ~7x/sec
-            {
-                FILE* tf = fopen("mp_replay_go.txt", "r");
-                if (tf)
-                {
-                    fclose(tf); remove("mp_replay_go.txt");
-                    apRecStarted = 1; apAnchorFrame = apFrame;
-                    apRepCount = apRepIdx = 0; apRepMask = 0;
-                    FILE* rf = fopen("mp_record.txt", "r");
-                    if (rf)
-                    {
-                        u32 fr, mk;
-                        while (apRepCount < AP_REP_MAX && fscanf(rf, "%u %u", &fr, &mk) == 2)
-                        { apRepTab[apRepCount].f = fr; apRepTab[apRepCount].mask = mk; apRepCount++; }
-                        fclose(rf);
-                    }
-                    printf("[AP] replay triggered: %d events\n", apRepCount); fflush(stdout);
-                }
-            }
-        }
-        if (apRecStarted)
-        {
-            u32 ff = apFrame - apAnchorFrame;
-            while (apRepIdx < apRepCount && apRepTab[apRepIdx].f <= ff)
-            { apRepMask = apRepTab[apRepIdx].mask; apRepIdx++; }
-            press |= apRepMask;
-        }
-    }
-
-    if (!press && !apTouchFrames) return;
-
-    UserInput& in = NDS_getProcessingUserInput();
-    if (apTouchFrames > 0)
-    {
-        // scripted stylus press: the options appearance RIGHT arrow
-        apTouchFrames--;
-        in.touch.touchX = 230;
-        in.touch.touchY = 151;
-        in.touch.isTouch = true;
-    }
-    if (press & (1 << 0))  in.buttons.A = true;
-    if (press & (1 << 1))  in.buttons.B = true;
-    if (press & (1 << 2))  in.buttons.T = true;   // select
-    if (press & (1 << 3))  in.buttons.S = true;   // start
-    if (press & (1 << 4))  in.buttons.R = true;   // d-pad right
-    if (press & (1 << 5))  in.buttons.L = true;   // d-pad left
-    if (press & (1 << 6))  in.buttons.U = true;
-    if (press & (1 << 7))  in.buttons.D = true;
-    if (press & (1 << 10)) in.buttons.X = true;
-    if (press & (1 << 11)) in.buttons.Y = true;
-}
-// MARKER_TEST

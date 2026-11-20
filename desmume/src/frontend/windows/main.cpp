@@ -1269,7 +1269,6 @@ static void StepRunLoop_Core()
 	NDS_beginProcessingInput();
 	{
 		input_process();
-		MpAp_OverrideInput();   // Platinum autopilot: scripted test input
 		FCEUMOV_HandlePlayback();
 		CallRegisteredLuaFunctions(LUACALL_BEFOREEMULATION);
 	}
@@ -1949,8 +1948,6 @@ int _main()
 	}
 
 	LoadWinPCap(isPCapSupported);
-
-	MpBridge_InitFromEnv();   // Platinum mailbox bridge + autopilot (env-gated)
 
 	driver = new WinDriver();
 	WinGPUEvent = new GPUEventHandlerWindows;
