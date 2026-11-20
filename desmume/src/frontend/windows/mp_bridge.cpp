@@ -150,6 +150,9 @@ struct MpPeer
 {
     SOCKET s = INVALID_SOCKET;
     bool up = false;
+    bool authed = true;         // false while a password host waits for the joiner's password
+    u32 upAt = 0;               // GetTickCount at accept
+    u32 ip = 0;
     std::vector<u8> rx, tx;
 };
 
@@ -199,7 +202,71 @@ struct MpNet
     }
 
     int myRole() const { return (mode == 1) ? 1 : (assignedRole ? assignedRole : 2); }
-    bool anyUp() const { for (int i = 0; i < 7; i++) if (peers[i].up) return true; return false; }
+    bool anyUp() const { for (int i = 0; i < 7; i++) if (peers[i].up && peers[i].authed) return true; return false; }
+
+    // ---- direct-hosting password (LAN / direct IP only; online rooms use the room code) ----
+    char password[32] = "";     // host: required from joiners; joiner: sent on connect
+    int authFail = 0;           // joiner: 1 = wrong password, 2 = host needs one
+    struct Ban { u32 ip = 0; int fails = 0; u32 until = 0; } bans[16];
+    int banNext = 0;
+
+    void setPassword(const char* pw)
+    {
+        strncpy(password, pw ? pw : "", sizeof(password) - 1);
+        password[sizeof(password) - 1] = 0;
+    }
+    // Five failed joins from one address lock it out for five minutes.
+    bool ipBlocked(u32 ip)
+    {
+        for (Ban& b : bans)
+            if (b.ip == ip && b.fails >= 5)
+            {
+                if ((int)(b.until - GetTickCount()) > 0) return true;
+                b.fails = 0;
+            }
+        return false;
+    }
+    void noteFail(u32 ip)
+    {
+        Ban* b = NULL;
+        for (Ban& c : bans) if (c.ip == ip) { b = &c; break; }
+        if (!b) { b = &bans[banNext]; banNext = (banNext + 1) % 16; b->ip = ip; b->fails = 0; }
+        b->fails++;
+        b->until = GetTickCount() + 300000;
+    }
+    // Tell the joiner why (1 wrong password, 2 password required), then drop it.
+    void rejectPeer(int i, u8 reason)
+    {
+        u8 f[4] = { 2, 0, 0xFA, reason };
+        ::send(peers[i].s, (const char*)f, 4, 0);
+        noteFail(peers[i].ip);
+        printf("[BR] peer %d refused (%s)\n", i, reason == 1 ? "wrong password" : "no password sent");
+        dropPeer(i);
+    }
+    // Host: the first frame from an unauthenticated peer must be [0xFB][0][len][password].
+    void checkPassword(int i, const u8* rx, u32 n)
+    {
+        if (n < 3 || rx[0] != 0xFB) return;   // anything else waits for the timeout
+        size_t want = strlen(password);
+        u8 diff = (u8)(rx[2] ^ want);
+        if (rx[2] == want && n >= 3 + want)
+            for (size_t k = 0; k < want; k++) diff |= (u8)(rx[3 + k] ^ (u8)password[k]);
+        else diff = 1;
+        if (diff) { rejectPeer(i, 1); return; }
+        peers[i].authed = true; freshPeer = true;
+        u8 ctl[4] = { 2, 0, 0xFF, (u8)(2 + i) };
+        peers[i].tx.insert(peers[i].tx.end(), ctl, ctl + 4);
+        printf("[BR] peer %d password ok -> role %d\n", i, 2 + i);
+    }
+    // Joiner: send our password as the first frame on a direct link.
+    void sendPassword()
+    {
+        size_t nl = strlen(password);
+        if (!nl) return;
+        u8 f[3 + sizeof(password)] = { 0xFB, 0, (u8)nl };
+        memcpy(f + 3, password, nl);
+        enqueue(0, f, (u32)(3 + nl));
+    }
     // Host: slot i may only speak as role 2+i. Joiners trust the host's relay.
     bool roleAllowed(int slot, int role) const { return mode != 1 || role == 2 + slot; }
 
@@ -257,7 +324,7 @@ struct MpNet
     {
         mode = 2;
         if (ip && ip[0]) { strncpy(joinIP, ip, sizeof(joinIP)-1); joinIP[sizeof(joinIP)-1] = 0; }
-        connecting = false; retryAt = 0;
+        connecting = false; retryAt = 0; authFail = 0;
         for (int i = 0; i < 7; i++) dropPeer(i);
     }
 
@@ -348,7 +415,7 @@ struct MpNet
     bool startHostOnline(const char* server)
     {
         if (!resolveRelay(server)) return false;
-        mode = 1; onlineMode = 1;
+        mode = 1; onlineMode = 1; password[0] = 0;
         relayFatal = false; roomCode[0] = 0;
         ctlState = 0; ctlRetryAt = 0; ctlBuf.clear();
         setRelayStatus("contacting relay...");
@@ -359,7 +426,7 @@ struct MpNet
     bool startJoinOnline(const char* server, const char* code)
     {
         if (!resolveRelay(server)) return false;
-        mode = 2; onlineMode = 2;
+        mode = 2; onlineMode = 2; password[0] = 0; authFail = 0;
         relayFatal = false; roomCode[0] = 0;
         if (code && code[0]) setRoomCode(code);
         joinState = 0; joinRetryAt = 0; joinBuf.clear();
@@ -766,6 +833,7 @@ struct MpNet
         if (p.s != INVALID_SOCKET) closesocket(p.s);
         p.s = INVALID_SOCKET;
         p.up = false;
+        p.authed = true;
         p.rx.clear();
         p.tx.clear();
         if (mode == 2) connecting = false;
@@ -783,17 +851,28 @@ struct MpNet
             // reconnects, so a rejoining player gets its old role back)
             for (int i = 0; i < 7; i++)
             {
-                if (peers[i].up) continue;
-                SOCKET s = accept(listener, NULL, NULL);
+                if (peers[i].up)
+                {
+                    // a password host gives a joiner 5 s to send it
+                    if (!peers[i].authed && GetTickCount() - peers[i].upAt > 5000) rejectPeer(i, 2);
+                    continue;
+                }
+                sockaddr_in from; int fl = sizeof(from);
+                SOCKET s = accept(listener, (sockaddr*)&from, &fl);
                 if (s == INVALID_SOCKET) break;
+                if (ipBlocked(from.sin_addr.s_addr)) { closesocket(s); continue; }
                 setNonBlock(s);
-                peers[i].s = s; peers[i].up = true; freshPeer = true;
+                peers[i].s = s; peers[i].up = true;
+                peers[i].ip = from.sin_addr.s_addr; peers[i].upAt = GetTickCount();
+                peers[i].authed = !password[0];
+                if (!peers[i].authed) { printf("[BR] peer %d connected, waiting for password\n", i); continue; }
+                freshPeer = true;
                 u8 ctl[4] = { 2, 0, 0xFF, (u8)(2 + i) };   // [len=2][0xFF][role]
                 peers[i].tx.insert(peers[i].tx.end(), ctl, ctl + 4);
                 printf("[BR] peer accepted -> role %d\n", 2 + i);
             }
         }
-        else if (mode == 2 && !onlineMode && !peers[0].up)   // LAN/direct join only
+        else if (mode == 2 && !onlineMode && !peers[0].up && !authFail)   // LAN/direct join only
         {
             MpPeer& h = peers[0];
             if (connecting)
@@ -805,6 +884,7 @@ struct MpNet
                 if (r > 0 && FD_ISSET(h.s, &wr))
                 {
                     h.up = true; connecting = false; freshPeer = true;
+                    sendPassword();
                     printf("[BR] connected to %s\n", joinIP);
                 }
                 else if (r > 0 && FD_ISSET(h.s, &ex))
@@ -822,7 +902,7 @@ struct MpNet
                 a.sin_family = AF_INET; a.sin_port = htons(MP_PORT);
                 inet_pton(AF_INET, joinIP, &a.sin_addr);
                 int r = connect(h.s, (sockaddr*)&a, sizeof(a));
-                if (r == 0) { h.up = true; printf("[BR] connected to %s\n", joinIP); }
+                if (r == 0) { h.up = true; sendPassword(); printf("[BR] connected to %s\n", joinIP); }
                 else if (WSAGetLastError() == WSAEWOULDBLOCK) connecting = true;
                 else { dropPeer(0); retryAt = frame + 120; }
             }
@@ -834,7 +914,7 @@ struct MpNet
     void enqueue(int i, const u8* p, u32 n)
     {
         MpPeer& pr = peers[i];
-        if (!pr.up || n == 0 || n > MP_MAX_FRAME) return;
+        if (!pr.up || !pr.authed || n == 0 || n > MP_MAX_FRAME) return;
         if (pr.tx.size() > 512 * 1024) return;
         u8 hdr[2] = { (u8)(n & 0xFF), (u8)(n >> 8) };
         pr.tx.insert(pr.tx.end(), hdr, hdr + 2);
@@ -865,7 +945,13 @@ struct MpNet
         {
             int r = ::recv(p.s, tmp, sizeof(tmp), 0);
             if (r > 0) { p.rx.insert(p.rx.end(), tmp, tmp + r); if (p.rx.size() > 1024*1024) { dropPeer(i); return; } }
-            else if (r == 0) { dropPeer(i); printf("[BR] peer %d closed\n", i); return; }
+            else if (r == 0)
+            {
+                // a refusal and the close arrive together: read the reason before dropping
+                if (mode == 2 && i == 0 && p.rx.size() >= 4 && p.rx[0] == 2 && p.rx[1] == 0 && p.rx[2] == 0xFA)
+                    authFail = (p.rx[3] == 2) ? 2 : 1;
+                dropPeer(i); printf("[BR] peer %d closed\n", i); return;
+            }
             else
             {
                 if (WSAGetLastError() != WSAEWOULDBLOCK) { dropPeer(i); printf("[BR] peer %d error\n", i); }
@@ -1048,7 +1134,11 @@ INT_PTR CALLBACK LobbyProc(HWND h, UINT m, WPARAM w, LPARAM l)
                 gNet.roomCode[0] ? gNet.roomCode : "?",
                 gNet.anyUp() ? "connected"
                              : (gNet.relayStatus[0] ? gNet.relayStatus : "connecting..."));
-        else if (gNet.mode == 1) _snprintf(st, sizeof(st), "Hosting on port 7820 - waiting for players");
+        else if (gNet.mode == 1) _snprintf(st, sizeof(st), "Hosting on port 7820%s - waiting for players",
+            gNet.password[0] ? " (password set)" : "");
+        else if (gNet.authFail) _snprintf(st, sizeof(st), "%s",
+            gNet.authFail == 2 ? "This host needs a password - leave and rejoin with it"
+                               : "Wrong password - leave and rejoin");
         else _snprintf(st, sizeof(st), "%s %s", gNet.anyUp() ? "Connected to" : "Connecting to", gNet.joinIP);
         SetDlgItemTextA(h, 200, st);
         HWND lb = GetDlgItem(h, 201);
@@ -1099,11 +1189,16 @@ void OpenLobby(HWND parent)
 
 // --- host dialog (name entry) ---
 static char gDlgName[24];
+static char gDlgPass[32];   // kept for the session only, never saved
 INT_PTR CALLBACK HostProc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
-    if (m == WM_INITDIALOG) { SetDlgItemTextA(h, 100, gNet.myName); SetFocus(GetDlgItem(h, 100)); return FALSE; }
+    if (m == WM_INITDIALOG) { SetDlgItemTextA(h, 100, gNet.myName); SetDlgItemTextA(h, 105, gDlgPass); SetFocus(GetDlgItem(h, 100)); return FALSE; }
     if (m == WM_COMMAND) {
-        if (LOWORD(w) == IDOK) { GetDlgItemTextA(h, 100, gDlgName, sizeof(gDlgName)); EndDialog(h, 1); return TRUE; }
+        if (LOWORD(w) == IDOK) {
+            GetDlgItemTextA(h, 100, gDlgName, sizeof(gDlgName));
+            GetDlgItemTextA(h, 105, gDlgPass, sizeof(gDlgPass));
+            EndDialog(h, 1); return TRUE;
+        }
         if (LOWORD(w) == IDCANCEL) { EndDialog(h, 0); return TRUE; }
     }
     return FALSE;
@@ -1115,6 +1210,7 @@ INT_PTR CALLBACK JoinProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_INITDIALOG:
         SetDlgItemTextA(h, 100, gNet.myName);
         SetDlgItemTextA(h, 102, gNet.joinIP);
+        SetDlgItemTextA(h, 105, gDlgPass);
         SetTimer(h, 2, 700, NULL);
         return FALSE;
     case WM_TIMER: {
@@ -1132,6 +1228,7 @@ INT_PTR CALLBACK JoinProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_COMMAND:
         if (LOWORD(w) == IDOK) {
             GetDlgItemTextA(h, 100, gDlgName, sizeof(gDlgName));
+            GetDlgItemTextA(h, 105, gDlgPass, sizeof(gDlgPass));
             char ip[64] = {0};
             int sel = (int)SendMessageA(GetDlgItem(h, 101), LB_GETCURSEL, 0, 0);
             if (sel >= 0 && sel < gFoundN) strncpy(ip, gFound[sel].ip, 63);
@@ -1148,25 +1245,29 @@ INT_PTR CALLBACK JoinProc(HWND h, UINT m, WPARAM w, LPARAM l)
 }
 bool ShowHostDialog(HWND parent)
 {
-    static BYTE buf[1024]; memset(buf, 0, sizeof(buf));
-    BYTE* p = BeginDlg(buf, 4, 180, 62, L"Host LAN Game");
+    static BYTE buf[2048]; memset(buf, 0, sizeof(buf));
+    BYTE* p = BeginDlg(buf, 6, 180, 92, L"Host LAN Game");
     AddItem(p, SS_LEFT, 8, 8, 160, 10, (WORD)-1, 0x0082, L"Your name:");
     AddItem(p, WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 8, 22, 164, 12, 100, 0x0081, L"");
-    AddItem(p, WS_TABSTOP | BS_DEFPUSHBUTTON, 60, 42, 56, 14, IDOK, 0x0080, L"Host Game");
-    AddItem(p, WS_TABSTOP | BS_PUSHBUTTON, 122, 42, 50, 14, IDCANCEL, 0x0080, L"Cancel");
+    AddItem(p, SS_LEFT, 8, 40, 164, 10, (WORD)-1, 0x0082, L"Password (optional, blank = open):");
+    AddItem(p, WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 8, 52, 164, 12, 105, 0x0081, L"");
+    AddItem(p, WS_TABSTOP | BS_DEFPUSHBUTTON, 60, 72, 56, 14, IDOK, 0x0080, L"Host Game");
+    AddItem(p, WS_TABSTOP | BS_PUSHBUTTON, 122, 72, 50, 14, IDCANCEL, 0x0080, L"Cancel");
     return DialogBoxIndirectParamA(GetModuleHandle(NULL), (LPCDLGTEMPLATEA)buf, parent, HostProc, 0) == 1;
 }
 bool ShowJoinDialog(HWND parent)
 {
-    static BYTE buf[1536]; memset(buf, 0, sizeof(buf));
-    BYTE* p = BeginDlg(buf, 7, 200, 150, L"Join LAN Game");
+    static BYTE buf[2048]; memset(buf, 0, sizeof(buf));
+    BYTE* p = BeginDlg(buf, 9, 200, 168, L"Join LAN Game");
     AddItem(p, SS_LEFT, 8, 8, 80, 10, (WORD)-1, 0x0082, L"Your name:");
     AddItem(p, WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 88, 6, 104, 12, 100, 0x0081, L"");
     AddItem(p, SS_LEFT, 8, 24, 184, 10, (WORD)-1, 0x0082, L"LAN games found:");
     AddItem(p, WS_BORDER | WS_TABSTOP | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT, 8, 36, 184, 70, 101, 0x0083, L"");
     AddItem(p, SS_LEFT, 8, 110, 60, 10, (WORD)-1, 0x0082, L"or IP address:");
     AddItem(p, WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 70, 108, 122, 12, 102, 0x0081, L"");
-    AddItem(p, WS_TABSTOP | BS_DEFPUSHBUTTON, 74, 130, 50, 14, IDOK, 0x0080, L"Join");
+    AddItem(p, SS_LEFT, 8, 128, 60, 10, (WORD)-1, 0x0082, L"Password:");
+    AddItem(p, WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 70, 126, 122, 12, 105, 0x0081, L"");
+    AddItem(p, WS_TABSTOP | BS_DEFPUSHBUTTON, 74, 148, 50, 14, IDOK, 0x0080, L"Join");
     // Cancel shares the row via IDCANCEL implicit (Esc) — add explicit:
     return DialogBoxIndirectParamA(GetModuleHandle(NULL), (LPCDLGTEMPLATEA)buf, parent, JoinProc, 0) == 1;
 }
@@ -1369,12 +1470,12 @@ bool MpBridge_HandleCommand(unsigned int id)
 {
     HWND w = GetActiveWindow();
     if (id == MP_ID_HOST) {
-        if (ShowHostDialog(w)) { gNet.setName(gDlgName); gNet.startHost(); MpArm(); OpenLobby(w); }
+        if (ShowHostDialog(w)) { gNet.setName(gDlgName); gNet.setPassword(gDlgPass); gNet.startHost(); MpArm(); OpenLobby(w); }
         return true;
     }
     if (id == MP_ID_JOIN) {
         gFoundN = 0;
-        if (ShowJoinDialog(w) && gNet.joinIP[0]) { gNet.setName(gDlgName); gNet.joinTo(gNet.joinIP); MpArm(); OpenLobby(w); }
+        if (ShowJoinDialog(w) && gNet.joinIP[0]) { gNet.setName(gDlgName); gNet.setPassword(gDlgPass); gNet.joinTo(gNet.joinIP); MpArm(); OpenLobby(w); }
         return true;
     }
     if (id == MP_ID_HOSTON) {
@@ -1675,6 +1776,14 @@ void MpBridge_Pump()
         while ((n = gNet.recvFrame(pi, rx, sizeof(rx))) > 0)
         {
             gBr.dbgRx++;
+            if (!gNet.peers[pi].authed) { gNet.checkPassword(pi, rx, n); continue; }
+            if (rx[0] == 0xFB) continue;
+            if (n == 2 && rx[0] == 0xFA)
+            {
+                // the host refused us: stop redialling and let the lobby say why
+                if (gNet.mode == 2 && pi == 0) { gNet.authFail = (rx[1] == 2) ? 2 : 1; gNet.dropPeer(0); }
+                continue;
+            }
             if (n == 2 && rx[0] == 0xFF)
             {
                 // role assignment: only a joiner takes it, and only from the host link
