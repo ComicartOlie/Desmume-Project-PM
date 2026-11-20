@@ -43,6 +43,12 @@ static inline void apWr8(u32 a, u8 v) { T1WriteByte(MMU.MAIN_MEM, a & _MMU_MAIN_
 static inline u8* apPtr(u32 a) { return &MMU.MAIN_MEM[a & _MMU_MAIN_MEM_MASK]; }
 static inline void apWr32(u32 a, u32 v) { T1WriteLong(MMU.MAIN_MEM, a & _MMU_MAIN_MEM_MASK32, v); }
 
+// Names arrive from other machines: blank out control characters before showing or logging them.
+static void mpCleanName(char* s)
+{
+    for (; *s; s++) if ((unsigned char)*s < 0x20 || *s == 0x7F) *s = '?';
+}
+
 // ---------------------------------------------------------------------------
 // Transport: one non-blocking TCP link (host listens :7820, joiner connects).
 // Frame: [u16 len LE][payload]; payload = the melonDS bridge bundle.
@@ -1075,16 +1081,22 @@ void MpBrowsePoll()
 {
     gNet.startBeaconRx();
     if (gNet.beaconRx == INVALID_SOCKET) return;
-    for (;;) {
+    for (int guard = 0; guard < 64; guard++) {   // bounded: a beacon flood must not stall the dialog
         u8 buf[64]; sockaddr_in from; int fl = sizeof(from);
         int r = recvfrom(gNet.beaconRx, (char*)buf, sizeof(buf), 0, (sockaddr*)&from, &fl);
-        if (r < 8) break;
-        if (memcmp(buf, "PLATMP", 6) != 0) continue;
+        if (r < 0) { if (WSAGetLastError() == WSAEMSGSIZE) continue; break; }
+        if (r < 8 || memcmp(buf, "PLATMP", 6) != 0) continue;
         char ip[32]; strcpy(ip, inet_ntoa(from.sin_addr));
         char nm[28]; memset(nm, 0, sizeof(nm)); memcpy(nm, buf + 8, (r - 8 < 24) ? (r - 8) : 24);
+        mpCleanName(nm);
         int idx = -1;
         for (int i = 0; i < gFoundN; i++) if (!strcmp(gFound[i].ip, ip)) { idx = i; break; }
         if (idx < 0 && gFoundN < 8) idx = gFoundN++;
+        if (idx < 0) {                            // list full: the stalest entry gives way
+            idx = 0;
+            for (int i = 1; i < gFoundN; i++) if (gFound[i].seen > gFound[idx].seen) idx = i;
+            if (gFound[idx].seen == 0) idx = -1;
+        }
         if (idx >= 0) { strncpy(gFound[idx].ip, ip, 31); strncpy(gFound[idx].name, nm, 27); gFound[idx].seen = 0; }
     }
     for (int i = 0; i < gFoundN; ) { if (++gFound[i].seen > 12) { gFound[i] = gFound[--gFoundN]; } else i++; }
@@ -1813,6 +1825,7 @@ void MpBridge_Pump()
                 if (r2 >= 1 && r2 <= 8 && nl <= 23 && (u32)n >= (u32)(5 + nl)
                     && gNet.roleAllowed(pi, r2)) {
                     memcpy(gNet.rname[r2], rx + 5, nl); gNet.rname[r2][nl] = 0; gNet.rping[r2] = png;
+                    mpCleanName(gNet.rname[r2]);
                     gBr.roleSeenAt[r2] = gBr.frame;
                     if (myRole == 1) for (int pj = 0; pj < 7; pj++) if (pj != pi) gNet.enqueue(pj, rx, n);
                 }
