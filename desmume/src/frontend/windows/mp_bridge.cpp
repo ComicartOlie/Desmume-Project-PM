@@ -200,6 +200,8 @@ struct MpNet
 
     int myRole() const { return (mode == 1) ? 1 : (assignedRole ? assignedRole : 2); }
     bool anyUp() const { for (int i = 0; i < 7; i++) if (peers[i].up) return true; return false; }
+    // Host: slot i may only speak as role 2+i. Joiners trust the host's relay.
+    bool roleAllowed(int slot, int role) const { return mode != 1 || role == 2 + slot; }
 
     static void setNonBlock(SOCKET s)
     {
@@ -1675,9 +1677,12 @@ void MpBridge_Pump()
             gBr.dbgRx++;
             if (n == 2 && rx[0] == 0xFF)
             {
-                // control: host-assigned role (joiner side)
-                gNet.assignedRole = rx[1];
-                gNet.sendName(gNet.myRole());   // announce our name on join
+                // role assignment: only a joiner takes it, and only from the host link
+                if (gNet.mode == 2 && pi == 0 && rx[1] >= 2 && rx[1] <= 8)
+                {
+                    gNet.assignedRole = rx[1];
+                    gNet.sendName(gNet.myRole());
+                }
                 continue;
             }
             if (n == 6 && rx[0] == 0xFD) {
@@ -1696,7 +1701,8 @@ void MpBridge_Pump()
             if (n >= 5 && rx[0] == 0xFE) {
                 // lobby name announce: [0xFE][role][ping16][len][name]
                 int r2 = rx[1]; u16 png = (u16)(rx[2] | (rx[3] << 8)); int nl = rx[4];
-                if (r2 >= 1 && r2 <= 8 && nl <= 23 && (u32)n >= (u32)(5 + nl)) {
+                if (r2 >= 1 && r2 <= 8 && nl <= 23 && (u32)n >= (u32)(5 + nl)
+                    && gNet.roleAllowed(pi, r2)) {
                     memcpy(gNet.rname[r2], rx + 5, nl); gNet.rname[r2][nl] = 0; gNet.rping[r2] = png;
                     gBr.roleSeenAt[r2] = gBr.frame;
                     if (myRole == 1) for (int pj = 0; pj < 7; pj++) if (pj != pi) gNet.enqueue(pj, rx, n);
@@ -1707,6 +1713,7 @@ void MpBridge_Pump()
             int tag = rx[0], r = rx[1];
             u32 sz = (u32)(rx[2] | (rx[3] << 8));
             if (r < 1 || r > 8 || r == myRole) continue;
+            if (!gNet.roleAllowed(pi, r)) continue;
             if (n < 4 + sz) continue;
 
             // Host relay: clients only reach the host — forward every client
