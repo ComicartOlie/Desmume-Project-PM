@@ -58,18 +58,7 @@ const u8  MP_WIRE_VER = 2;        // wire version: LAN beacon byte AND relay han
 // server migrations). A player-entered value in the ini always wins.
 const char* MP_DEFAULT_RELAY = "193.122.236.144:7833";
 
-// ---------------------------------------------------------------------------
-// Windows Firewall helper for hosting.  Router port-forwarding alone can't
-// make a host reachable: the inbound connection must also pass this PC's own
-// firewall, and declining the first-launch security alert leaves a permanent
-// block rule for the exe ("I forwarded 7820 and my friend still can't join").
-// The "Allow" prompt also defaults to private networks only, which drops
-// peers when the home network is profiled Public.  On host start we check
-// the world-readable firewall-rules registry key; if our rule is absent we
-// ASK the player, then run the standard netsh repair visibly with one
-// admin prompt (same repair the PlatinumMP launcher's Fix-Firewall button
-// does for its own exe).
-// ---------------------------------------------------------------------------
+// Hosting needs an inbound firewall rule; if ours is missing we ask, then add it with one admin prompt.
 const wchar_t* MP_FW_RULE = L"DeSmuME (Project PM)";
 
 static void mpFwLower(std::wstring& s)
@@ -84,7 +73,8 @@ static bool mpFwRulePresent(const wchar_t* exe)
         L"SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\FirewallRules",
         0, KEY_READ, &k) != ERROR_SUCCESS) return false;
 
-    // rule values are pipe-delimited token strings: v2.x|Action=Allow|...|App=path|...|Name=...|
+    // rule values are pipe-delimited tokens: v2.x|Action=Allow|...|App=path|...|Name=...|
+    std::wstring wantPort = L"|lport="; wantPort += std::to_wstring(MP_PORT); wantPort += L"|";
     std::wstring wantName = L"|name="; wantName += MP_FW_RULE; wantName += L"|";
     std::wstring wantApp  = L"|app=";  wantApp  += exe;        wantApp  += L"|";
     mpFwLower(wantName); mpFwLower(wantApp);
@@ -102,6 +92,8 @@ static bool mpFwRulePresent(const wchar_t* exe)
         mpFwLower(v);
         found = v.find(wantName) != std::wstring::npos
              && v.find(wantApp)  != std::wstring::npos
+             && v.find(wantPort) != std::wstring::npos   // older builds opened every port
+             && v.find(L"|protocol=6|")   != std::wstring::npos
              && v.find(L"|action=allow|") != std::wstring::npos
              && v.find(L"|dir=in|")       != std::wstring::npos
              && v.find(L"|active=true|")  != std::wstring::npos;
@@ -123,12 +115,12 @@ static void mpEnsureFirewall()
 
     if (mpFwRulePresent(exe)) { printf("[BR] firewall rule ok\n"); return; }
 
-    // Ask the player first, and run the repair in a visible window so
-    // nothing about this is silent.
     if (MessageBoxW(NULL,
         L"To let friends join your hosted game, Windows Firewall needs an\n"
-        L"inbound rule for this emulator (without it, players outside your\n"
-        L"PC usually can't connect even with the port forwarded).\n\n"
+        L"inbound rule for this emulator on TCP port 7820 (without it,\n"
+        L"players outside your PC usually can't connect even with the port\n"
+        L"forwarded).  Any existing firewall rules for this emulator are\n"
+        L"replaced by it.\n\n"
         L"Add the rule now?  Windows will show one administrator prompt.",
         L"Project PM - enable hosting", MB_YESNO | MB_ICONQUESTION) != IDYES)
     {
@@ -136,12 +128,20 @@ static void mpEnsureFirewall()
         return;
     }
 
-    wchar_t args[1200];
-    swprintf(args, 1200,
-        L"/c netsh advfirewall firewall delete rule name=all program=\"%ls\" & "
-        L"netsh advfirewall firewall add rule name=\"%ls\" dir=in action=allow "
-        L"program=\"%ls\" enable=yes profile=any", exe, MP_FW_RULE, exe);
-    HINSTANCE rc = ShellExecuteW(NULL, L"runas", L"cmd.exe", args, NULL, SW_SHOWMINNOACTIVE);
+    // Full System32 paths: this runs elevated, so nothing may be found by name.
+    wchar_t sys[MAX_PATH];
+    UINT sn = GetSystemDirectoryW(sys, MAX_PATH);
+    if (!sn || sn >= MAX_PATH) return;
+    std::wstring cmd = std::wstring(sys) + L"\\cmd.exe";
+
+    // The delete clears the block rule a declined Windows prompt leaves behind.
+    wchar_t args[1600];
+    swprintf(args, 1600,
+        L"/s /c \"\"%ls\\netsh.exe\" advfirewall firewall delete rule name=all program=\"%ls\" & "
+        L"\"%ls\\netsh.exe\" advfirewall firewall add rule name=\"%ls\" dir=in action=allow "
+        L"program=\"%ls\" protocol=TCP localport=%d enable=yes profile=any\"",
+        sys, exe, sys, MP_FW_RULE, exe, MP_PORT);
+    HINSTANCE rc = ShellExecuteW(NULL, L"runas", cmd.c_str(), args, sys, SW_SHOWMINNOACTIVE);
     printf("[BR] firewall rule %s\n",
         ((INT_PTR)rc > 32) ? "repair launched" : "not added (admin prompt declined)");
 }
